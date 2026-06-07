@@ -1,0 +1,95 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-display: 'Syne', sans-serif;
+  --font-body:    'DM Sans', sans-serif;
+}
+
+:root {
+  --page: #f8fafc;
+  --surface: #ffffff;
+  --surface-card: #ffffff;
+  --border: #e6e9ef;
+  --text: #0f172a;
+  --text-muted: #6b7280;
+  --text-hint: #94a3b8;
+  --green: #10b981;
+  --green-light: #ecfdf5;
+  --green-dark: #047857;
+  --amber: #f59e0b;
+  --red: #ef4444;
+  --gray-50: #f9fafb;
+  --gray-100: #f3f4f6;
+}
+
+@layer base {
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--page);
+    color: var(--text);
+  }
+
+  ::-webkit-scrollbar       { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: #1e293b; }
+  ::-webkit-scrollbar-thumb { background: #475569; border-radius: 2px; }
+}
+
+@layer components {
+  .card {
+    @apply bg-white border border-gray-200 rounded-2xl p-5 text-slate-900;
+  }
+
+  .btn-primary {
+    @apply bg-emerald-600 hover:bg-emerald-700 text-white font-semibold
+           px-4 py-2.5 rounded-xl transition-colors text-sm;
+  }
+
+  .btn-ghost {
+    @apply text-slate-600 hover:text-slate-900 hover:bg-gray-50
+           px-3 py-2 rounded-xl transition-colors text-sm;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold;
+  }
+
+  .badge-paid    { @apply bg-emerald-500/15 text-emerald-400; }
+  .badge-pending { @apply bg-amber-500/15 text-amber-400; }
+  .badge-overdue { @apply bg-red-500/15 text-red-400; }
+  .badge-vacant  { @apply bg-slate-500/15 text-slate-400; }
+  .badge-rented  { @apply bg-blue-500/15 text-blue-400; }
+  .badge-owner   { @apply bg-violet-500/15 text-violet-400; }
+
+  .input {
+    @apply bg-white border border-gray-200 text-slate-900 placeholder-slate-400
+           rounded-xl px-4 py-2.5 text-sm w-full
+           focus:outline-none focus:border-emerald-500 transition-colors;
+  }
+
+  .page-title {
+    @apply font-display text-2xl font-bold text-slate-900 tracking-tight;
+  }
+
+  .section-label {
+    @apply text-xs font-semibold uppercase tracking-widest text-slate-500;
+  }
+}
+
+/* Fade-in animation */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.fade-up {
+  animation: fadeUp 0.4s ease both;
+}
+
+.fade-up-1 { animation-delay: 0.05s; }
+.fade-up-2 { animation-delay: 0.10s; }
+.fade-up-3 { animation-delay: 0.15s; }
+.fade-up-4 { animation-delay: 0.20s; }
+.fade-up-5 { animation-delay: 0.25s; }
