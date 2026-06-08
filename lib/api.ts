@@ -7,7 +7,12 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   })
   const json = await res.json()
-  if (!json.success) throw new Error(json.message ?? 'API error')
+  if (!json.success) {
+    const err: any = new Error(json.message ?? 'API error')
+    // attach structured details if present so UI can render field errors
+    if (json.details) err.details = json.details
+    throw err
+  }
   return json.data as T
 }
 
@@ -28,8 +33,11 @@ export type Flat = {
 
 export type Person = {
   id: string; name: string; phone: string; email?: string; isActive: boolean
+  aadhaarLast4?: string; panNumber?: string
   ownerships?: { flat: { flatNumber: string; block: { name: string } } }[]
   tenancies?:  { flat: { flatNumber: string; block: { name: string } } }[]
+  vehicles?: Vehicle[]
+  createdAt?: string; updatedAt?: string
 }
 
 export type Payment = {
@@ -58,6 +66,16 @@ export type Expense = {
   amount: number; vendor?: string; expenseDate: string
 }
 
+export type Tenancy = {
+  id: string; residentId: string; flatId: string; startDate: string; endDate?: string
+  rentAmount?: number; deposit?: number; createdAt?: string; endedAt?: string
+}
+
+export type Vehicle = {
+  id: string; residentId: string; flatId?: string; type: 'CAR' | 'BIKE' | 'SCOOTER' | 'CYCLE' | 'OTHER' | string;
+  plateNumber: string; make?: string; model?: string; color?: string; parkingSlot?: string; createdAt?: string
+}
+
 // ── API calls ─────────────────────────────────────────────────
 
 export const api = {
@@ -78,6 +96,27 @@ export const api = {
   getResident:  (id: string) => req<Person>(`/residents/${id}`),
   addResident:  (data: Partial<Person>) =>
     req<Person>('/residents', { method: 'POST', body: JSON.stringify(data) }),
+  updateResident: (id: string, data: Partial<Person>) =>
+    req<Person>(`/residents/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteResident: (id: string) =>
+    req<any>(`/residents/${id}`, { method: 'DELETE' }),
+
+  // Resident related actions
+  addTenancy: (residentId: string, data: { flatId: string; startDate: string; rentAmount?: number; deposit?: number }) =>
+    req<Tenancy>(`/residents/${residentId}/tenancy`, { method: 'POST', body: JSON.stringify(data) }),
+  endTenancy: (residentId: string, tenancyId: string, data?: { endDate?: string }) =>
+    req<any>(`/residents/${residentId}/tenancy/${tenancyId}/end`, { method: 'PATCH', body: JSON.stringify(data || {}) }),
+  updateTenancy: (residentId: string, tenancyId: string, data: Partial<Tenancy>) =>
+    req<Tenancy>(`/residents/${residentId}/tenancy/${tenancyId}`, { method: 'PATCH', body: JSON.stringify(data) }),
+
+  addVehicle: (residentId: string, data: { flatId: string; type: 'CAR' | 'BIKE' | 'SCOOTER' | 'CYCLE' | 'OTHER' | string; plateNumber: string; make?: string; model?: string; color?: string; parkingSlot?: string }) =>
+    req<Vehicle>(`/residents/${residentId}/vehicle`, { method: 'POST', body: JSON.stringify(data) }),
+  updateVehicle: (residentId: string, vehicleId: string, data: Partial<Vehicle>) =>
+    req<Vehicle>(`/residents/${residentId}/vehicle/${vehicleId}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteVehicle: (residentId: string, vehicleId: string) =>
+    req<any>(`/residents/${residentId}/vehicle/${vehicleId}`, { method: 'DELETE' }),
+
+  getResidentPayments: (residentId: string) => req<any>(`/residents/${residentId}/payments`),
 
   // Payments
   getPayments:    (params = '') => req<Payment[]>(`/payments${params}`),

@@ -43,18 +43,73 @@ function DetailPanel({ entry, onClose, onPaymentRecorded }: { entry: any; onClos
   const [mode, setMode]             = useState('CASH')
   const [lateFee, setLateFee]       = useState(0)
   const [saving, setSaving]         = useState(false)
+  const [showEditModal, setShowEditModal] = useState(false)
+  const [editPerson, setEditPerson] = useState<any | null>(null)
+  const [showVehiclesModal, setShowVehiclesModal] = useState(false)
+  const [vehicleAdding, setVehicleAdding] = useState(false)
+  const [newVehicle, setNewVehicle] = useState<any>({ type: 'CAR', plateNumber: '', make: '', model: '', color: '' })
 
   const { person, flat, role, vehicles, vehicle } = entry
-  // Cross reference: resolve owner and tenant from entry
-  const owner = role === 'Owner' ? person : (entry.ownerships?.[0]?.person ?? flat?.ownerships?.[0]?.person)
-  const tenant = role === 'Tenant' ? person : (entry.tenancies?.[0]?.person ?? flat?.tenancies?.[0]?.person)
-  const allVehicles = entry.vehicles ?? (vehicles ?? (vehicle ? [vehicle] : []))
+  // Cross reference: resolve owner and tenant from explicit ownerships/tenancies first.
+  let owner: any = null
+  let tenant: any = null
+
+  const tryOwnershipPerson = (o: any) => o?.person ?? (o?.personId ? { id: o.personId, name: o.personName ?? 'Owner' } : null)
+  const tryTenancyPerson = (t: any) => t?.person ?? (t?.personId ? { id: t.personId, name: t.personName ?? 'Tenant' } : null)
+
+  // 1) If entry.ownerships/tenancies include person objects, use them
+  if (entry.ownerships?.length) owner = tryOwnershipPerson(entry.ownerships[0])
+  if (entry.tenancies?.length) tenant = tryTenancyPerson(entry.tenancies[0])
+
+  // 2) If flat has embedded ownerships/tenancies, prefer those
+  if (!owner && flat?.ownerships?.length) owner = tryOwnershipPerson(flat.ownerships[0])
+  if (!tenant && flat?.tenancies?.length) tenant = tryTenancyPerson(flat.tenancies[0])
+
+  // 3) If `person` (clicked) is present and has ownerships/tenancies pointing to this flat, use that
+  if (person) {
+    const pid = person.id
+    if (!owner && (person.ownerships?.some((o: any) => o.flatId === flat?.id) || (entry.ownerships?.some((o: any) => o.personId === pid)))) owner = person
+    if (!tenant && (person.tenancies?.some((t: any) => t.flatId === flat?.id) || (entry.tenancies?.some((t: any) => t.personId === pid)))) tenant = person
+  }
+
+  // 4) Respect explicit role flag — use clicked person for that role only
+  if (role === 'Owner' && !owner && person) owner = person
+  if (role === 'Tenant' && !tenant && person) tenant = person
+
+  // 5) Last resort: if owner/tenant are still null but entry.person exists, don't assign both; prefer owner then tenant
+  if (!owner && !tenant && entry.person) owner = entry.person
+
+  // Vehicles: prefer vehicles attached to the resolved person(s), else entry-level vehicles
+  const personVehicles = (owner?.id === person?.id ? person?.vehicles : null) ?? (tenant?.id === person?.id ? person?.vehicles : null)
+  const allVehicles = entry.vehicles ?? personVehicles ?? person?.vehicles ?? vehicles ?? (vehicle ? [vehicle] : []) ?? []
+
+  // Debugging: log mapping inputs
+  console.log('[DEBUG] DetailPanel entry id', { personId: person?.id ?? entry.personId ?? null, flatId: flat?.id ?? entry.flatId ?? null })
+  console.log('[DEBUG] owner resolved', owner?.id ?? null, owner)
+  console.log('[DEBUG] tenant resolved', tenant?.id ?? null, tenant)
+  console.log('[DEBUG] flat resolved', flat?.id ?? null, flat)
+  console.log('[DEBUG] vehicles resolved', (allVehicles || []).length, allVehicles)
+
+  // Resolve tenancy summary
+  const tenancy = entry.tenancies?.[0] ?? flat?.tenancies?.[0]
+
+  // Occupancy: prefer explicit flat flags if present, otherwise infer from tenancies/ownerships
+  const occupancyKey = flat?.status ?? (
+    tenancy ? 'RENTED' : (flat?.ownerships?.length ? 'OWNER_OCCUPIED' : 'VACANT')
+  )
+  const occupancy = occupancyKey
+  const occupancyStyle = STATUS_BADGE[occupancy] ?? { bg: '#F1EFE8', color: '#5F5E5A' }
 
   const loadPayments = async () => {
-    if (!flat?.id) return
+    if (!flat?.id) {
+      console.warn('[DEBUG] loadPayments: missing flat.id, skipping payments load', flat)
+      return
+    }
     setPayLoading(true)
     try {
+      console.log('[DEBUG] loadPayments: fetching payments for flatId=', flat.id)
       const p = await api.getPayments(`?flatId=${flat.id}`)
+      console.log('[DEBUG] loadPayments: payments response', p)
       setPayments(p.sort((a: Payment, b: Payment) => b.billingMonth.localeCompare(a.billingMonth)))
       setShowPayments(true)
     } catch (e) {
@@ -75,6 +130,58 @@ function DetailPanel({ entry, onClose, onPaymentRecorded }: { entry: any; onClos
       await loadPayments()
       onPaymentRecorded()
     } finally { setSaving(false) }
+  }
+
+  const openEdit = (p: any) => {
+    if (!p) return
+    setEditPerson(p)
+    setShowEditModal(true)
+  }
+
+  const saveEdit = async () => {
+    if (!editPerson?.id) return
+    try {
+      setSaving(true)
+      console.log('[DEBUG] saveEdit: payload', editPerson)
+      const updated = await api.updateResident(editPerson.id, {
+        name: editPerson.name,
+        phone: editPerson.phone,
+        altPhone: editPerson.altPhone,
+        email: editPerson.email,
+        aadhaarLast4: editPerson.aadhaarLast4,
+        panNumber: editPerson.panNumber,
+      })
+      console.log('[DEBUG] saveEdit: response', updated)
+      setShowEditModal(false)
+    } catch (e: any) {
+      alert(e.message || 'Update failed')
+      console.error(e)
+    } finally { setSaving(false) }
+  }
+
+  const openVehicles = () => {
+    setShowVehiclesModal(true)
+  }
+
+  const handleAddVehicle = async () => {
+    const residentId = person?.id ?? owner?.id ?? tenant?.id
+    if (!residentId) return alert('Cannot determine resident')
+    setVehicleAdding(true)
+    try {
+      const payload = { flatId: flat?.id, type: newVehicle.type, plateNumber: newVehicle.plateNumber, make: newVehicle.make, model: newVehicle.model, color: newVehicle.color }
+      console.log('[DEBUG] addVehicle: payload', { residentId, payload })
+      const vres = await api.addVehicle(residentId, payload)
+      console.log('[DEBUG] addVehicle: response', vres)
+      setNewVehicle({ type: 'CAR', plateNumber: '', make: '', model: '', color: '' })
+      try {
+        const refreshed = await api.getResident(residentId)
+        setSelected((prev: any) => prev && (prev.person?.id === residentId || prev.ownerships?.[0]?.person?.id === residentId) ? { ...prev, ...refreshed } : prev)
+      } catch (_) {}
+      setShowVehiclesModal(false)
+    } catch (e: any) {
+      alert(e.message || 'Failed to add vehicle')
+      console.error(e)
+    } finally { setVehicleAdding(false) }
   }
 
   const roleStyle = role ? (ROLE_BADGE[role] ?? ROLE_BADGE.Owner) : null
@@ -109,11 +216,21 @@ function DetailPanel({ entry, onClose, onPaymentRecorded }: { entry: any; onClos
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
             <Avatar name={person?.name ?? owner?.name ?? tenant?.name} size={48} />
-            <div>
-              <div style={{ fontSize: 17, fontWeight: 700, color: 'var(--green-dark)', marginBottom: 6 }}>{person?.name ?? owner?.name ?? tenant?.name ?? 'Unknown'}</div>
-              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' as const }}>
-                {roleStyle && <Badge label={role} bg={roleStyle.bg} color={roleStyle.color} dot={roleStyle.dot} />}
-                {flat && <Badge label={`${flat.block} · ${flat.flatNumber}`} bg="rgba(29,158,117,.15)" color="var(--green-dark)" />}
+            <div style={{ flex: 1 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                <div>
+                  <div style={{ fontSize: 17, fontWeight: 700, color: 'var(--green-dark)', marginBottom: 6 }}>{person?.name ?? owner?.name ?? tenant?.name ?? 'Unknown'}</div>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' as const }}>
+                    {roleStyle && <Badge label={role} bg={roleStyle.bg} color={roleStyle.color} dot={roleStyle.dot} />}
+                    {flat && <Badge label={`${flat.block?.name ?? flat.block} · ${flat.flatNumber}`} bg="rgba(29,158,117,.12)" color="var(--green-dark)" />}
+                  </div>
+                </div>
+                    {flat && (
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: occupancyStyle.color, background: occupancyStyle.bg, padding: '6px 10px', borderRadius: 14 }}>{occupancy === 'RENTED' ? 'Tenant Occupied' : occupancy === 'OWNER_OCCUPIED' ? 'Owner Occupied' : 'Vacant'}</div>
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{flat.block?.name ?? flat.block} · Flat {flat.flatNumber}</div>
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -122,47 +239,61 @@ function DetailPanel({ entry, onClose, onPaymentRecorded }: { entry: any; onClos
         {/* Scrollable body */}
         <div style={{ flex: 1, overflowY: 'auto', padding: 0 }}>
 
-          {/* Owner */}
-          <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)' }}>
-            {sectionTitle('ti-user-circle', 'Owner')}
+          <details style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)' }} open>
+            <summary style={{ listStyle: 'none', marginBottom: 8 }}>{sectionTitle('ti-user-circle', 'Owner')}</summary>
             {owner ? (
               <>
                 {detailRow('ti-user', 'Name', owner.name)}
                 {owner.phone && detailRow('ti-phone', 'Phone', owner.phone)}
                 {owner.altPhone && detailRow('ti-phone', 'Alternate', <span style={{ color: 'var(--text-muted)' }}>{owner.altPhone}</span>)}
+                {owner.email && detailRow('ti-mail', 'Email', owner.email)}
+                {owner.aadhaarLast4 && detailRow('ti-id', 'Aadhaar (last 4)', `•••• ${owner.aadhaarLast4}`)}
+                {owner.panNumber && detailRow('ti-id', 'PAN', owner.panNumber)}
                 {owner.address && <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-muted)' }}>{owner.address}</div>}
                 <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
-                  <a href={`tel:${owner.phone}`} className="btn-ghost">Call Owner</a>
-                  <button onClick={() => window.location.href = (owner?.id ? `/residents/${owner.id}` : '/residents')} className="btn-ghost">Edit Owner</button>
+                  {owner.phone && <a href={`tel:${owner.phone}`} className="btn-ghost">Call Owner</a>}
+                  <button onClick={() => openEdit(owner)} className="btn-ghost">Edit Owner</button>
+                  <button onClick={() => { if (tenancy) openEdit(tenancy.person) }} className="btn-ghost">View Tenant</button>
                 </div>
               </>
             ) : (
               <div className="text-sm text-slate-500">No owner information</div>
             )}
-          </div>
+          </details>
 
-          {/* Tenant */}
-          <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)' }}>
-            {sectionTitle('ti-user', 'Tenant')}
+          <details style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)' }} open>
+            <summary style={{ listStyle: 'none', marginBottom: 8 }}>{sectionTitle('ti-user', 'Tenant')}</summary>
             {tenant ? (
               <>
                 {detailRow('ti-user', 'Name', tenant.name)}
                 {tenant.phone && detailRow('ti-phone', 'Phone', tenant.phone)}
-                {tenant.familyMembers && <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-muted)' }}>Family: {tenant.familyMembers.join(', ')}</div>}
-                {tenant.moveInDate && <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-muted)'}}>Moved in: {tenant.moveInDate}</div>}
+                {tenant.altPhone && detailRow('ti-phone', 'Alternate', <span style={{ color: 'var(--text-muted)' }}>{tenant.altPhone}</span>)}
+                {tenant.email && detailRow('ti-mail', 'Email', tenant.email)}
+                {tenant.aadhaarLast4 && detailRow('ti-id', 'Aadhaar (last 4)', `•••• ${tenant.aadhaarLast4}`)}
+                {tenant.panNumber && detailRow('ti-id', 'PAN', tenant.panNumber)}
+                {tenancy?.startDate && <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-muted)'}}>Moved in: {tenancy.startDate}</div>}
+                {tenancy?.rent && detailRow('ti-coin', 'Rent', `₹${tenancy.rent}`)}
+                {tenancy?.deposit && detailRow('ti-coin', 'Security deposit', `₹${tenancy.deposit}`)}
                 <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
-                  <a href={`tel:${tenant.phone}`} className="btn-ghost">Call Tenant</a>
-                  <button onClick={() => window.location.href = (tenant?.id ? `/residents/${tenant.id}` : '/residents')} className="btn-ghost">Edit Tenant</button>
+                  {tenant.phone && <a href={`tel:${tenant.phone}`} className="btn-ghost">Call Tenant</a>}
+                  <button onClick={() => openEdit(tenant)} className="btn-ghost">Edit Tenant</button>
+                  <button onClick={() => { if (tenancy?.id) openEdit(tenant) }} className="btn-ghost">Manage Tenancy</button>
                 </div>
               </>
             ) : (
               <div className="text-sm text-slate-500">Vacant / No tenant information</div>
             )}
-          </div>
+          </details>
 
           {/* Vehicles */}
           <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)' }}>
             {sectionTitle('ti-car', 'Vehicles')}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{allVehicles.length} vehicle{allVehicles.length !== 1 ? 's' : ''}</div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button onClick={() => openVehicles()} className="btn-ghost">Manage Vehicles</button>
+              </div>
+            </div>
             <div style={{ display: 'flex', flexWrap: 'wrap' as const, gap: 6 }}>
               {allVehicles.map((v: any, i: number) => (
                 <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '6px 10px', borderRadius: 12, background: 'var(--gray-50)', border: '1px solid var(--border)', fontSize: 12, fontWeight: 600, color: 'var(--gray-800)' }}>
@@ -282,6 +413,66 @@ function DetailPanel({ entry, onClose, onPaymentRecorded }: { entry: any; onClos
               <button onClick={handleRecord} disabled={saving} style={{ flex: 1, padding: '9px', borderRadius: 10, background: 'var(--green)', color: '#fff', border: '1px solid var(--green)', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
                 {saving ? 'Saving…' : `Confirm ₹${(Number(recording.totalAmount) + lateFee).toLocaleString()}`}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Edit resident modal */}
+      {showEditModal && editPerson && (
+        <div style={{ position: 'absolute', inset: 0, zIndex: 60, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+          <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.06)' }} onClick={() => setShowEditModal(false)} />
+          <div style={{ position: 'relative', width: '100%', maxWidth: 520, background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 18, boxShadow: 'var(--shadow-md)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+              <div style={{ fontSize: 15, fontWeight: 700 }}>Edit Resident</div>
+              <button onClick={() => setShowEditModal(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}><i className="ti ti-x" style={{ fontSize: 18 }} /></button>
+            </div>
+            <div style={{ display: 'grid', gap: 8 }}>
+              <input value={editPerson.name || ''} onChange={e => setEditPerson({ ...editPerson, name: e.target.value })} placeholder="Name" style={{ padding: 10, borderRadius: 8, border: '1px solid var(--border)' }} />
+              <input value={editPerson.phone || ''} onChange={e => setEditPerson({ ...editPerson, phone: e.target.value })} placeholder="Phone" style={{ padding: 10, borderRadius: 8, border: '1px solid var(--border)' }} />
+              <input value={editPerson.altPhone || ''} onChange={e => setEditPerson({ ...editPerson, altPhone: e.target.value })} placeholder="Alternate phone" style={{ padding: 10, borderRadius: 8, border: '1px solid var(--border)' }} />
+              <input value={editPerson.email || ''} onChange={e => setEditPerson({ ...editPerson, email: e.target.value })} placeholder="Email" style={{ padding: 10, borderRadius: 8, border: '1px solid var(--border)' }} />
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input value={editPerson.aadhaarLast4 || ''} onChange={e => setEditPerson({ ...editPerson, aadhaarLast4: e.target.value })} placeholder="Aadhaar (last 4)" style={{ padding: 10, borderRadius: 8, border: '1px solid var(--border)', flex: 1 }} />
+                <input value={editPerson.panNumber || ''} onChange={e => setEditPerson({ ...editPerson, panNumber: e.target.value })} placeholder="PAN" style={{ padding: 10, borderRadius: 8, border: '1px solid var(--border)', flex: 1 }} />
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                <button onClick={() => setShowEditModal(false)} className="btn-ghost">Cancel</button>
+                <button onClick={saveEdit} className="btn-primary">Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Vehicles modal */}
+      {showVehiclesModal && (
+        <div style={{ position: 'absolute', inset: 0, zIndex: 60, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+          <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.06)' }} onClick={() => setShowVehiclesModal(false)} />
+          <div style={{ position: 'relative', width: '100%', maxWidth: 680, background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 18, boxShadow: 'var(--shadow-md)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+              <div style={{ fontSize: 15, fontWeight: 700 }}>Manage Vehicles</div>
+              <button onClick={() => setShowVehiclesModal(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}><i className="ti ti-x" style={{ fontSize: 18 }} /></button>
+            </div>
+            <div style={{ display: 'grid', gap: 10 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                <select value={newVehicle.type} onChange={e => setNewVehicle({ ...newVehicle, type: e.target.value })} style={{ padding: 10, borderRadius: 8, border: '1px solid var(--border)' }}>
+                  <option>CAR</option>
+                  <option>BIKE</option>
+                  <option>SCOOTER</option>
+                  <option>CYCLE</option>
+                  <option>OTHER</option>
+                </select>
+                <input value={newVehicle.plateNumber} onChange={e => setNewVehicle({ ...newVehicle, plateNumber: e.target.value })} placeholder="Registration number" style={{ padding: 10, borderRadius: 8, border: '1px solid var(--border)' }} />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                <input value={newVehicle.make} onChange={e => setNewVehicle({ ...newVehicle, make: e.target.value })} placeholder="Make" style={{ padding: 10, borderRadius: 8, border: '1px solid var(--border)' }} />
+                <input value={newVehicle.model} onChange={e => setNewVehicle({ ...newVehicle, model: e.target.value })} placeholder="Model" style={{ padding: 10, borderRadius: 8, border: '1px solid var(--border)' }} />
+              </div>
+              <input value={newVehicle.color} onChange={e => setNewVehicle({ ...newVehicle, color: e.target.value })} placeholder="Color" style={{ padding: 10, borderRadius: 8, border: '1px solid var(--border)' }} />
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                <button onClick={() => setShowVehiclesModal(false)} className="btn-ghost">Close</button>
+                <button onClick={handleAddVehicle} disabled={vehicleAdding || !newVehicle.plateNumber} className="btn-primary">{vehicleAdding ? 'Adding…' : 'Add Vehicle'}</button>
+              </div>
             </div>
           </div>
         </div>
@@ -474,10 +665,80 @@ export default function SearchPage() {
               ]
               const ac = avatarColors[i % avatarColors.length]
 
+              const handleClick = async (entry: any) => {
+                // Debug: log the clicked search result
+                console.log('[DEBUG] search: clicked entry', entry)
+
+                // Always show the inline detail modal. If we can resolve a person id, fetch full resident data first.
+                const personId = entry.person?.id ?? entry.ownerships?.[0]?.person?.id ?? entry.tenancies?.[0]?.person?.id
+                if (personId) {
+                  try {
+                    console.log('[DEBUG] search: fetching resident id', personId)
+                    const resident = await api.getResident(personId)
+                    console.log('[DEBUG] search: resident response', resident)
+
+                    // Determine flatId from entry or resident's linked records
+                    const flatId = entry.flat?.id
+                      ?? (resident.ownerships?.[0] as any)?.flatId
+                      ?? (resident.tenancies?.[0] as any)?.flatId
+                      ?? (resident.ownerships?.[0] as any)?.flat?.id
+                      ?? (resident.tenancies?.[0] as any)?.flat?.id
+                    let flatFull = entry.flat
+                    if (flatId) {
+                      try {
+                        flatFull = await api.getFlat(flatId)
+                        console.log('[DEBUG] search: fetched full flat', flatFull)
+                      } catch (e) {
+                        console.warn('[DEBUG] search: failed to fetch full flat', flatId, e)
+                      }
+                    }
+
+                    // Determine role of fetched resident for the flat
+                    let roleForFlat = entry.role
+                    if (resident.ownerships?.some((o: any) => o.flatId === flatId)) roleForFlat = 'Owner'
+                    else if (resident.tenancies?.some((t: any) => t.flatId === flatId)) roleForFlat = 'Tenant'
+
+                    // If flat has an owner person id different from the clicked person, fetch owner details to show owner vehicles
+                    let ownershipsSource = flatFull?.ownerships ?? resident.ownerships ?? []
+                    let ownerResident: any = null
+                    try {
+                      const primaryOwner = ownershipsSource.find((o: any) => o.isPrimary) ?? ownershipsSource[0]
+                      const ownerPid = (primaryOwner?.person?.id) ?? primaryOwner?.personId
+                      if (ownerPid && ownerPid !== personId) {
+                        console.log('[DEBUG] search: fetching owner resident id', ownerPid)
+                        ownerResident = await api.getResident(ownerPid)
+                        console.log('[DEBUG] search: owner resident response', ownerResident)
+                        // attach fetched owner person into ownerships for richer display
+                        ownershipsSource = [{ ...primaryOwner, person: ownerResident }, ...ownershipsSource.filter((o: any) => o !== primaryOwner)]
+                      }
+                    } catch (e) {
+                      console.warn('[DEBUG] search: failed to fetch owner resident', e)
+                    }
+
+                    const mergedVehicles = [ ...(ownerResident?.vehicles ?? []), ...(resident.vehicles ?? []), ...(entry.vehicles ?? []) ]
+
+                    const composed = {
+                      person: resident,
+                      flat: flatFull,
+                      role: roleForFlat,
+                      ownerships: ownershipsSource,
+                      tenancies: flatFull?.tenancies ?? resident.tenancies,
+                      vehicles: mergedVehicles
+                    }
+                    console.log('[DEBUG] search: composed entry for modal', composed)
+                    setSelected(composed)
+                    return
+                  } catch (e) {
+                    console.error('[DEBUG] search: failed to fetch resident for detail modal', e)
+                  }
+                }
+                setSelected(entry)
+              }
+
               return (
                 <div
                   key={i}
-                  onClick={() => setSelected(r)}
+                  onClick={() => handleClick(r)}
                   style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px', borderBottom: '1px solid var(--border)', cursor: 'pointer', transition: 'background .12s' }}
                   onMouseEnter={e => (e.currentTarget.style.background = 'var(--green-light)')}
                   onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
@@ -494,7 +755,7 @@ export default function SearchPage() {
                       )}
                       {r.flat && (
                         <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--text-muted)' }}>
-                          <i className="ti ti-building" aria-hidden style={{ fontSize: 12 }} /> {r.flat.block} · {r.flat.flatNumber}
+                          <i className="ti ti-building" aria-hidden style={{ fontSize: 12 }} /> {r.flat.block?.name ?? r.flat.block} · {r.flat.flatNumber}
                         </span>
                       )}
                       {(r.vehicle ?? r.vehicles?.[0]) && (
