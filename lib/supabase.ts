@@ -1,8 +1,15 @@
 // lib/supabase.ts
 import { createClient } from '@supabase/supabase-js'
 
-const url = process.env.NEXT_PUBLIC_SUPABASE_URL!
-const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+// Prefer client-visible NEXT_PUBLIC vars, but fall back to server-only envs
+const url = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL
+const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY
+
+if (!url || !key) {
+  throw new Error(
+    'Supabase env vars are missing. Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY (for client) or SUPABASE_URL and SUPABASE_ANON_KEY (for server) in your environment or .env.local.'
+  )
+}
 
 export const supabase = createClient(url, key)
 
