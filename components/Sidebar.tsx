@@ -11,7 +11,9 @@ const MAIN_NAV: NavItem[] = [
   { label: 'Dashboard', href: '/dashboard',    icon: LayoutDashboard },
   { label: 'Payments',  href: '/payments',     icon: CreditCard      },
   { label: 'Expense', href: '/expenses',icon: BookOpen        },
-  { label: 'Flat Search', href: '/search',     icon: Search          },
+  { label: 'Flat Search', href: '/flat-search',     icon: Search          },
+  { label: 'Search', href: '/search',     icon: Search          },
+  { label: 'Payment History', href: '/payment-history',     icon: Search          },
 ]
 
 const DIR_NAV: NavItem[] = [

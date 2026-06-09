@@ -66,6 +66,16 @@ export type Expense = {
   amount: number; vendor?: string; expenseDate: string
 }
 
+export type PaymentHistoryEntry = {
+  date: string         // ISO "2026-01-05T09:12:00.000Z"
+  amount: number
+  mode: string
+  billingMonth: string | null  // "2026-01"
+  block: string | null
+  flatNumber: string | null
+  notes: string | null
+}
+
 export type Tenancy = {
   id: string; residentId: string; flatId: string; startDate: string; endDate?: string
   rentAmount?: number; deposit?: number; createdAt?: string; endedAt?: string
@@ -127,6 +137,14 @@ export const api = {
   recordPayment:  (id: string, data: { mode: string; lateFee?: number; notes?: string }) =>
     req<Payment>(`/payments/${id}/record`, { method: 'POST', body: JSON.stringify(data) }),
   markOverdue:    () => req<any>('/payments/mark-overdue', { method: 'PATCH' }),
+  getPaymentHistory: (params?: { year?: string; month?: string; block?: string }) => {
+    const p = new URLSearchParams()
+    if (params?.year)  p.set('year',  params.year)
+    if (params?.month) p.set('month', params.month)
+    if (params?.block) p.set('block', params.block)
+    const qs = p.toString()
+    return req<PaymentHistoryEntry[]>(`/payments/history/summary${qs ? '?' + qs : ''}`)
+  },
 
   // Announcements
   getAnnouncements: () => req<any[]>('/dashboard/announcements'),
