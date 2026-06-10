@@ -174,6 +174,8 @@ export const api = {
   // Edit works on the PaymentTransaction (single source of truth), not a maintenance row
   editPayment: (transactionId: string, data: EditPaymentPayload) =>
     req<Payment>(`/payments/transaction/${transactionId}/edit`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deletePayment: (transactionId: string) =>
+    req<any>(`/payments/transaction/${transactionId}`, { method: 'DELETE' }),
   markOverdue:    () => req<any>('/payments/mark-overdue', { method: 'PATCH' }),
   getPaymentHistory: (params?: { year?: string; month?: string; block?: string }) => {
     const p = new URLSearchParams()
