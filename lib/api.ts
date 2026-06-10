@@ -67,6 +67,7 @@ export type Expense = {
 }
 
 export type PaymentHistoryEntry = {
+  id: string           // maintenance payment DB id
   date: string         // ISO "2026-01-05T09:12:00.000Z"
   amount: number
   mode: string
@@ -84,6 +85,25 @@ export type Tenancy = {
 export type Vehicle = {
   id: string; residentId: string; flatId?: string; type: 'CAR' | 'BIKE' | 'SCOOTER' | 'CYCLE' | 'OTHER' | string;
   plateNumber: string; make?: string; model?: string; color?: string; parkingSlot?: string; createdAt?: string
+}
+
+export type RecordPaymentByFlatPayload = {
+  blockName: string
+  flatNumber: string
+  billingMonth: string | string[]  // "2026-05"  or  ["2026-03","2026-04","2026-05"]
+  amount: number
+  mode: 'ONLINE' | 'CASH'
+  paidAt: string              // ISO-8601 with offset, e.g. "2026-05-12T10:30:00+05:30"
+  lateFee?: number
+  notes?: string
+}
+
+export type EditPaymentPayload = {
+  mode?:    'ONLINE' | 'CASH' | 'UPI' | 'NEFT' | 'CHEQUE'
+  paidAt?:  string    // ISO-8601 with offset
+  amount?:  number
+  lateFee?: number
+  notes?:   string
 }
 
 // ── API calls ─────────────────────────────────────────────────
@@ -136,6 +156,10 @@ export const api = {
     req<any>('/payments/generate-bills', { method: 'POST', body: JSON.stringify({ billingMonth, amount }) }),
   recordPayment:  (id: string, data: { mode: string; lateFee?: number; notes?: string }) =>
     req<Payment>(`/payments/${id}/record`, { method: 'POST', body: JSON.stringify(data) }),
+  recordPaymentByFlat: (data: RecordPaymentByFlatPayload) =>
+    req<Payment>('/payments/record-by-flat', { method: 'POST', body: JSON.stringify(data) }),
+  editPayment: (id: string, data: EditPaymentPayload) =>
+    req<Payment>(`/payments/${id}/edit`, { method: 'PATCH', body: JSON.stringify(data) }),
   markOverdue:    () => req<any>('/payments/mark-overdue', { method: 'PATCH' }),
   getPaymentHistory: (params?: { year?: string; month?: string; block?: string }) => {
     const p = new URLSearchParams()
