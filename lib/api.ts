@@ -67,14 +67,27 @@ export type Expense = {
 }
 
 export type PaymentHistoryEntry = {
-  id: string           // maintenance payment DB id
-  date: string         // ISO "2026-01-05T09:12:00.000Z"
-  amount: number
-  mode: string
-  billingMonth: string | null  // "2026-01"
-  block: string | null
-  flatNumber: string | null
-  notes: string | null
+  // Transaction identity — primary key for edit/delete/receipt operations
+  id:             string          // PaymentTransaction.id
+  transactionRef: string | null   // human-readable TXN-xxxxx
+
+  // Payment details (stored once on the transaction)
+  date:         string            // ISO — processedAt
+  amount:       number            // TOTAL amount including lateFee
+  lateFee:      number
+  mode:         string
+  notes:        string | null
+
+  // Month coverage — the canonical list this transaction covers
+  paidMonths:   string[]          // ["2026-04","2026-05","2026-06"]
+  billingMonth: string | null     // primary month (last in paidMonths)
+
+  // Flat context
+  block:        string | null
+  flatNumber:   string | null
+
+  // Receipt
+  receiptNumber: string | null
 }
 
 export type Tenancy = {
@@ -101,7 +114,7 @@ export type RecordPaymentByFlatPayload = {
 export type EditPaymentPayload = {
   mode?:    'ONLINE' | 'CASH' | 'UPI' | 'NEFT' | 'CHEQUE'
   paidAt?:  string    // ISO-8601 with offset
-  amount?:  number
+  amount?:  number    // base amount excl. lateFee
   lateFee?: number
   notes?:   string
 }
@@ -158,8 +171,9 @@ export const api = {
     req<Payment>(`/payments/${id}/record`, { method: 'POST', body: JSON.stringify(data) }),
   recordPaymentByFlat: (data: RecordPaymentByFlatPayload) =>
     req<Payment>('/payments/record-by-flat', { method: 'POST', body: JSON.stringify(data) }),
-  editPayment: (id: string, data: EditPaymentPayload) =>
-    req<Payment>(`/payments/${id}/edit`, { method: 'PATCH', body: JSON.stringify(data) }),
+  // Edit works on the PaymentTransaction (single source of truth), not a maintenance row
+  editPayment: (transactionId: string, data: EditPaymentPayload) =>
+    req<Payment>(`/payments/transaction/${transactionId}/edit`, { method: 'PATCH', body: JSON.stringify(data) }),
   markOverdue:    () => req<any>('/payments/mark-overdue', { method: 'PATCH' }),
   getPaymentHistory: (params?: { year?: string; month?: string; block?: string }) => {
     const p = new URLSearchParams()
