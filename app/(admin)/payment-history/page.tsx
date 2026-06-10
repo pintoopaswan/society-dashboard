@@ -9,13 +9,16 @@ import { api, type PaymentHistoryEntry, type RecordPaymentByFlatPayload, type Ed
 type PaymentMode = 'ONLINE' | 'CASH'
 
 interface Payment {
-  id?: string
+  id?: string             // maintenancePayment.id
+  transactionId?: string  // PaymentTransaction.id — the edit key
   month: number
-  amount: number
+  amount: number          // full transaction amount (only on anchor month)
   date: string
   billingMonth: string
   mode: PaymentMode
   notes: string | null
+  paidMonths?: string[]   // all months covered by this transaction
+  isAnchorMonth?: boolean // last month in paidMonths — shows amount + date
 }
 
 interface Flat {
@@ -92,25 +95,50 @@ async function fetchAllPayments(): Promise<Flat[]> {
   }
 
   const map = new Map<string, Payment[]>()
+
   for (const entry of entries) {
-    if (!entry.block || !entry.flatNumber || !entry.billingMonth) continue
+    if (!entry.block || !entry.flatNumber) continue
+
     const block = normalizeBlock(entry.block)
     const flat  = normalizeFlat(entry.flatNumber)
-    const [, monthStr] = entry.billingMonth.split('-')
-    const monthNum = parseInt(monthStr, 10)
-    if (!monthNum) continue
-    const payment: Payment = {
-      id:           (entry as any).id ?? undefined,
-      month:        monthNum,
-      amount:       entry.amount,
-      date:         fmtDate(entry.date),
-      billingMonth: entry.billingMonth,
-      mode:         inferMode(entry.mode, entry.notes),
-      notes:        entry.notes,
-    }
-    const key = `${block}__${flat}`
+    const key   = `${block}__${flat}`
+
+    // Determine which months this transaction covers
+    // New model: paidMonths[] is canonical. Fall back to [billingMonth] for legacy rows.
+    const coveredMonths: string[] = (
+      entry.paidMonths && entry.paidMonths.length > 0
+        ? entry.paidMonths
+        : entry.billingMonth ? [entry.billingMonth] : []
+    )
+    if (coveredMonths.length === 0) continue
+
+    const sortedMonths = [...coveredMonths].sort()
+    const anchorMonth  = sortedMonths[sortedMonths.length - 1] // last = shows ₹ + date
+
     const existing = map.get(key) ?? []
-    existing.push(payment)
+
+    for (const month of sortedMonths) {
+      const [, monthStr] = month.split('-')
+      const monthNum = parseInt(monthStr, 10)
+      if (!monthNum) continue
+
+      const isAnchor = month === anchorMonth
+
+      existing.push({
+        id:            entry.id,            // maintenancePayment.id (if available)
+        transactionId: entry.id,            // transaction id — same for all months in group
+        month:         monthNum,
+        // Only the anchor month shows the real amount — others show 0 (badge only)
+        amount:        isAnchor ? entry.amount : 0,
+        date:          isAnchor ? fmtDate(String(entry.date)) : '',
+        billingMonth:  month,
+        mode:          inferMode(entry.mode, entry.notes),
+        notes:         entry.notes,
+        paidMonths:    sortedMonths,
+        isAnchorMonth: isAnchor,
+      })
+    }
+
     map.set(key, existing)
   }
 
@@ -833,8 +861,39 @@ function PaymentCell({ payment, loading, onEdit }: { payment?: Payment; loading?
       </td>
     )
   }
+
   const isOnline = payment.mode === 'ONLINE'
-  const color = isOnline ? '#059669' : '#2563eb'
+  const color    = isOnline ? '#059669' : '#2563eb'
+
+  // Non-anchor covered month — show a green badge only, no amount/date
+  // Clicking still opens the same transaction editor
+  if (!payment.isAnchorMonth) {
+    return (
+      <td
+        onClick={onEdit}
+        title={`Covered by transaction on ${payment.paidMonths?.join(', ')} — click to edit`}
+        style={{
+          padding: '6px 2px', textAlign: 'center', borderBottom: '1px solid #f1f5f9',
+          background: '#f0fdf4', verticalAlign: 'middle',
+          cursor: onEdit ? 'pointer' : 'default',
+          transition: 'background 0.12s ease',
+        }}
+        onMouseEnter={e => { if (onEdit) (e.currentTarget as HTMLElement).style.background = '#dcfce7' }}
+        onMouseLeave={e => { if (onEdit) (e.currentTarget as HTMLElement).style.background = '#f0fdf4' }}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+          <span style={{ fontSize: 13, color: '#16a34a' }}>✓</span>
+          <span style={{
+            fontSize: 8, fontWeight: 700, color, background: color + '14',
+            borderRadius: 4, padding: '1px 5px',
+          }}>PAID</span>
+        </div>
+      </td>
+    )
+  }
+
+  // Anchor month — shows full amount, date, mode, paidMonths count
+  const coveredCount = payment.paidMonths?.length ?? 1
   return (
     <td
       onClick={onEdit}
@@ -844,18 +903,27 @@ function PaymentCell({ payment, loading, onEdit }: { payment?: Payment; loading?
         background: '#f0fdf4', verticalAlign: 'top',
         cursor: onEdit ? 'pointer' : 'default',
         transition: 'background 0.12s ease',
-        position: 'relative',
       }}
       onMouseEnter={e => { if (onEdit) (e.currentTarget as HTMLElement).style.background = '#dcfce7' }}
       onMouseLeave={e => { if (onEdit) (e.currentTarget as HTMLElement).style.background = '#f0fdf4' }}
     >
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3 }}>
-        <span style={{ fontSize: 13, fontWeight: 700, color, whiteSpace: 'nowrap' }}>₹{payment.amount.toLocaleString('en-IN')}</span>
-        <span style={{ fontSize: 10, color: '#94a3b8' }}>{payment.date}</span>
-        <span style={{ fontSize: 9, fontWeight: 600, color, background: color + '18', borderRadius: 4, padding: '1px 5px', maxWidth: 72, textAlign: 'center', lineHeight: 1.5 }}>
-          {MONTHS[payment.month - 1]}
+        <span style={{ fontSize: 13, fontWeight: 700, color, whiteSpace: 'nowrap' }}>
+          ₹{payment.amount.toLocaleString('en-IN')}
         </span>
-        <span style={{ fontSize: 9, fontWeight: 700, color, background: color + '14', borderRadius: 4, padding: '1px 5px' }}>{payment.mode}</span>
+        <span style={{ fontSize: 10, color: '#94a3b8' }}>{payment.date}</span>
+        {coveredCount > 1 && (
+          <span style={{
+            fontSize: 8, fontWeight: 700, color: '#7c3aed',
+            background: '#7c3aed14', borderRadius: 4, padding: '1px 5px',
+            whiteSpace: 'nowrap',
+          }}>
+            {coveredCount} months
+          </span>
+        )}
+        <span style={{ fontSize: 9, fontWeight: 700, color, background: color + '14', borderRadius: 4, padding: '1px 5px' }}>
+          {payment.mode}
+        </span>
         {onEdit && (
           <span style={{ fontSize: 8, color: '#94a3b8', fontWeight: 500, marginTop: 1 }}>✎ edit</span>
         )}
@@ -928,9 +996,10 @@ export default function PaymentsPage() {
     setModalOpen(true)
   }
 
-  // Open edit modal from clicking a paid cell
+  // Open edit modal from clicking any paid cell — always loads the full transaction
   const openEditModal = (f: Flat, payment: Payment) => {
-    setEditPaymentId(payment.id)
+    // Use transactionId as the edit key — same for all months in a group
+    setEditPaymentId(payment.transactionId ?? payment.id)
     setEditPrefillBlock(f.block)
     setEditPrefillFlat(f.flat)
     setEditPrefill({
