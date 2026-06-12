@@ -67,13 +67,13 @@ export type Expense = {
 }
 
 export type PaymentHistoryEntry = {
-  // Transaction identity — primary key for edit/delete/receipt operations
-  id:             string          // PaymentTransaction.id
-  transactionRef: string | null   // human-readable TXN-xxxxx
+  // Transaction identity — primary key for edit/delete operations
+  id:             string          // PaymentTransaction.id  ← this is the MASTER transaction id
+  transactionRef: string | null   // human-readable TXN-xxxxxxxx
 
-  // Payment details (stored once on the transaction)
+  // Payment details (stored once on the master transaction)
   date:         string            // ISO — processedAt
-  amount:       number            // TOTAL amount including lateFee
+  amount:       number            // totalAmount = base + lateFee (the real collected figure)
   lateFee:      number
   mode:         string
   notes:        string | null
@@ -101,14 +101,14 @@ export type Vehicle = {
 }
 
 export type RecordPaymentByFlatPayload = {
-  blockName: string
-  flatNumber: string
+  blockName:    string
+  flatNumber:   string
   billingMonth: string | string[]  // "2026-05"  or  ["2026-03","2026-04","2026-05"]
-  amount: number
-  mode: 'ONLINE' | 'CASH'
-  paidAt: string              // ISO-8601 with offset, e.g. "2026-05-12T10:30:00+05:30"
-  lateFee?: number
-  notes?: string
+  amount:       number             // base amount (excl. lateFee)
+  mode:         'ONLINE' | 'CASH'
+  paidAt:       string             // ISO-8601 with offset, e.g. "2026-05-12T10:30:00+05:30"
+  lateFee?:     number
+  notes?:       string
 }
 
 export type EditPaymentPayload = {
@@ -171,11 +171,15 @@ export const api = {
     req<Payment>(`/payments/${id}/record`, { method: 'POST', body: JSON.stringify(data) }),
   recordPaymentByFlat: (data: RecordPaymentByFlatPayload) =>
     req<Payment>('/payments/record-by-flat', { method: 'POST', body: JSON.stringify(data) }),
-  // Edit works on the PaymentTransaction (single source of truth), not a maintenance row
+
+  // Edit/delete operate on the master PaymentTransaction id (entry.id from getPaymentHistory)
   editPayment: (transactionId: string, data: EditPaymentPayload) =>
     req<Payment>(`/payments/transaction/${transactionId}/edit`, { method: 'PATCH', body: JSON.stringify(data) }),
+
+  // Single DELETE call — the server now reverses all covered months in one go
   deletePayment: (transactionId: string) =>
     req<any>(`/payments/transaction/${transactionId}`, { method: 'DELETE' }),
+
   markOverdue:    () => req<any>('/payments/mark-overdue', { method: 'PATCH' }),
   getPaymentHistory: (params?: { year?: string; month?: string; block?: string }) => {
     const p = new URLSearchParams()
@@ -190,6 +194,102 @@ export const api = {
   getAnnouncements: () => req<any[]>('/dashboard/announcements'),
   addAnnouncement:  (data: any) =>
     req<any>('/dashboard/announcements', { method: 'POST', body: JSON.stringify(data) }),
+}
+
+// ── Report Types ──────────────────────────────────────────────
+
+export type CollectionReportMonth = {
+  billingMonth:    string   // "2026-06"
+  total:           number   // total bills generated
+  paid:            number
+  pending:         number
+  overdue:         number
+  totalCollected:  number
+  totalDue:        number
+  collectionRate:  number   // 0-100 %
+  onlineCount:     number
+  cashCount:       number
+}
+
+export type CollectionReport = {
+  current:   CollectionReportMonth
+  previous:  CollectionReportMonth
+  mom: {
+    amountDelta: number   // absolute ₹ change
+    amountPct:   number   // month-over-month % change
+    rateDelta:   number   // percentage-point change in collection rate
+    trend:       'up' | 'down' | 'flat'
+  }
+  trend12m: {
+    month:     string   // "YYYY-MM"
+    collected: number
+    payments:  number
+  }[]
+  byBlock: {
+    block:     string
+    collected: number
+    payments:  number
+    share:     number   // % of grand total
+  }[]
+  generatedAt: string   // ISO timestamp
+}
+
+export type DefaulterEntry = {
+  flatId:       string
+  flatNumber:   string
+  block:        string
+  residentName: string | null
+  phone:        string | null
+  unpaidMonths: number
+  totalDue:     number
+  oldestDue:    string | null   // ISO timestamp of earliest unpaid due date
+  daysOverdue:  number
+  agingBucket:  '0-30' | '31-60' | '60+'
+}
+
+export type DefaultersReport = {
+  defaulters: DefaulterEntry[]
+  total: {
+    count:    number
+    totalDue: number
+  }
+  buckets: {
+    bucket:   '0-30' | '31-60' | '60+'
+    count:    number
+    totalDue: number
+  }[]
+  page:        number
+  pageSize:    number
+  totalPages:  number
+  generatedAt: string
+}
+
+// ── Report API calls ──────────────────────────────────────────
+
+export const reports = {
+  /**
+   * Collection report for a given billing month.
+   * month must be "YYYY-MM" (e.g. "2026-06"). Defaults to current month if omitted.
+   * Includes current vs previous month, MoM delta, 12-month trend, and per-block breakdown.
+   */
+  getCollection: (month?: string) => {
+    const qs = month ? `?month=${month}` : ''
+    return req<CollectionReport>(`/reports/collection${qs}`)
+  },
+
+  /**
+   * Defaulters with aging buckets.
+   * bucket: 'all' | '0-30' | '31-60' | '60+'
+   * page / limit control pagination (backend max limit: 100).
+   */
+  getDefaulters: (
+    bucket: 'all' | '0-30' | '31-60' | '60+' = 'all',
+    page   = 1,
+    limit  = 20,
+  ) =>
+    req<DefaultersReport>(
+      `/reports/defaulters?bucket=${encodeURIComponent(bucket)}&page=${page}&limit=${limit}`
+    ),
 }
 
 // Search

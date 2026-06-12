@@ -15,15 +15,19 @@ type TabView = 'heatmap' | 'calendar' | 'recent'
 
 interface Payment {
   id?: string
-  transactionId?: string
+  transactionId?: string   // master PaymentTransaction.id — used for edit & delete
   month: number
-  amount: number
+  amount: number           // for ANCHOR rows: real totalAmount collected. for CLONE rows: 0 (never summed)
+  transactionAmount: number // always the real totalAmount — safe to display in tooltips/UI for any row
   date: string
-  billingMonth: string
+  billingMonth: string     // anchor billing month (primary / last in paidMonths)
   mode: PaymentMode
   notes: string | null
-  paidMonths?: string[]
-  isAnchorMonth?: boolean
+  lateFee?: number
+  receiptNumber?: string
+  transactionRef?: string
+  paidMonths?: string[]    // all billing months this single transaction covers
+  isAnchorMonth?: boolean  // true → real transaction row; false → heatmap-only clone
 }
 
 interface Flat {
@@ -91,40 +95,93 @@ function normalizeFlat(raw: string): string {
 
 async function fetchAllPayments(): Promise<Flat[]> {
   const entries: PaymentHistoryEntry[] = await api.getPaymentHistory({ year: '2026' })
-  // Each entry is one PaymentTransaction covering exactly one billing month.
-  const map = new Map<string, Payment[]>()
+
+  // ── How the API works after the migration ────────────────────────────────────
+  // The backend now creates ONE master PaymentTransaction per payment event.
+  // Paying Apr + May ₹400 produces a single entry:
+  //   { id: "txn-abc", transactionRef: "TXN-12345678", amount: 400,
+  //     paidMonths: ["2026-04","2026-05"], billingMonth: "2026-05" }
+  //
+  // Each entry is the canonical record. We build:
+  //   • ONE anchor Payment per entry (isAnchorMonth=true) — used for totals, edit, delete.
+  //   • Lightweight heatmap clones for months 2..N (isAnchorMonth=false) so the
+  //     heatmap/calendar `find(p => p.month === N)` resolves correctly for every month.
+  //     Clones share the same transactionId and are excluded from sum calculations.
+
+  const flatPayments = new Map<string, Payment[]>()
+
   for (const entry of entries) {
     if (!entry.block || !entry.flatNumber || !entry.billingMonth) continue
-    const block = normalizeBlock(entry.block)
-    const flat  = normalizeFlat(entry.flatNumber)
-    const key   = `${block}__${flat}`
-    const [, monthStr] = entry.billingMonth.split('-')
-    const monthNum = parseInt(monthStr, 10)
-    if (!monthNum) continue
-    const existing = map.get(key) ?? []
-    // Deduplicate: skip if this month is already recorded for this flat
-    if (existing.some(p => p.billingMonth === entry.billingMonth)) continue
-    existing.push({
-      id:            entry.id,
-      transactionId: entry.id,
-      month:         monthNum,
-      amount:        entry.amount,
-      date:          entry.date ? fmtDate(String(entry.date)) : '',
-      billingMonth:  entry.billingMonth,
-      mode:          inferMode(entry.mode, entry.notes),
-      notes:         entry.notes,
-      paidMonths:    [entry.billingMonth],
-      isAnchorMonth: true,
+
+    const block   = normalizeBlock(entry.block)
+    const flat    = normalizeFlat(entry.flatNumber)
+    const flatKey = `${block}__${flat}`
+
+    if (!flatPayments.has(flatKey)) flatPayments.set(flatKey, [])
+    const payments = flatPayments.get(flatKey)!
+
+    const coveredMonths: string[] = Array.isArray(entry.paidMonths) && entry.paidMonths.length
+      ? entry.paidMonths
+      : [entry.billingMonth]
+
+    const anchorBm  = coveredMonths[0]
+    const [, anchorMs] = anchorBm.split('-')
+    const anchorNum = parseInt(anchorMs, 10)
+    if (!anchorNum) continue
+
+    // ── Anchor row: one per master transaction ───────────────────────────────
+    payments.push({
+      id:                entry.id,
+      transactionId:     entry.id,
+      month:             anchorNum,
+      amount:            entry.amount,     // real total — included in sums
+      transactionAmount: entry.amount,     // same for anchor
+      date:              entry.date ? fmtDate(String(entry.date)) : '',
+      billingMonth:      anchorBm,
+      mode:              inferMode(entry.mode, entry.notes),
+      notes:             entry.notes,
+      lateFee:           entry.lateFee ?? 0,
+      receiptNumber:     entry.receiptNumber ?? undefined,
+      transactionRef:    entry.transactionRef ?? undefined,
+      paidMonths:        coveredMonths,
+      isAnchorMonth:     true,
     })
-    map.set(key, existing)
+
+    // ── Heatmap clones for months 2..N ──────────────────────────────────────
+    // Clones are display-only markers so the heatmap `find(p => p.month === N)`
+    // resolves for every covered month. They carry amount=0 so that any code
+    // path that accidentally sums without filtering isAnchorMonth still gets
+    // the correct total — the ₹400 lives only on the anchor row.
+    for (let i = 1; i < coveredMonths.length; i++) {
+      const bm     = coveredMonths[i]
+      const [, ms] = bm.split('-')
+      const mn     = parseInt(ms, 10)
+      if (!mn) continue
+      payments.push({
+        id:                entry.id,
+        transactionId:     entry.id,
+        month:             mn,
+        amount:            0,              // ← zero: clones are status markers, not money
+        transactionAmount: entry.amount,   // real total — safe for display/tooltips only
+        date:              entry.date ? fmtDate(String(entry.date)) : '',
+        billingMonth:      bm,
+        mode:              inferMode(entry.mode, entry.notes),
+        notes:             entry.notes,
+        lateFee:           entry.lateFee ?? 0,
+        receiptNumber:     entry.receiptNumber ?? undefined,
+        transactionRef:    entry.transactionRef ?? undefined,
+        paidMonths:        coveredMonths,
+        isAnchorMonth:     false,          // excluded from totals and transactions tab
+      })
+    }
   }
+
   return FLAT_STRUCTURE.map(({ block, flat }) => ({
     block, flat,
-    payments: map.get(`${block}__${flat}`) ?? [],
+    payments: flatPayments.get(`${block}__${flat}`) ?? [],
     loading: false, error: false,
   }))
 }
-
 // ─── Flat structure ───────────────────────────────────────────────────────────
 
 const ALL_BLOCKS      = ['Block-1','Block-2','Block-3','Block-4','Block-5','Block-6','Block-7','Block-8','Block-9']
@@ -435,22 +492,62 @@ function AddPaymentModal({
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-              {/* Edit mode: locked context banner */}
+              {/* Edit mode: locked transaction context — covered months as chips, no per-month editing */}
               {editMode ? (
-                <div style={{ padding: '12px 16px', borderRadius: 10, background: '#f8fafc', border: '1px solid #e2e8f0', display: 'flex', alignItems: 'center', gap: 20 }}>
-                  <div>
-                    <p style={{ margin: 0, fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Flat</p>
-                    <p style={{ margin: '2px 0 0', fontSize: 14, fontWeight: 800, color: '#0f172a' }}>{prefillBlock} \u00b7 {prefillFlat}</p>
-                  </div>
-                  <div style={{ width: 1, height: 32, background: '#e2e8f0' }} />
-                  <div>
-                    <p style={{ margin: 0, fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Billing Month</p>
-                    <p style={{ margin: '2px 0 0', fontSize: 14, fontWeight: 800, color: '#0f172a' }}>
-                      {editPrefill?.billingMonth ? `${MONTH_LABELS[parseInt(editPrefill.billingMonth.split('-')[1], 10) - 1]} ${editPrefill.billingMonth.split('-')[0]}` : '-'}
+                <>
+                  {/* Flat + transaction identity */}
+                  <div style={{ padding: '12px 16px', borderRadius: 10, background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 20, marginBottom: 10 }}>
+                      <div>
+                        <p style={{ margin: 0, fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Flat</p>
+                        <p style={{ margin: '2px 0 0', fontSize: 14, fontWeight: 800, color: '#0f172a' }}>{prefillBlock} · {prefillFlat}</p>
+                      </div>
+                      <div style={{ width: 1, height: 32, background: '#e2e8f0' }} />
+                      {/* Covered months as locked chips — architecture rule: months are not independently editable */}
+                      <div style={{ flex: 1 }}>
+                        <p style={{ margin: '0 0 5px', fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                          Covers {((editPrefill as any)?.paidMonths?.length ?? 1) > 1
+                            ? `${(editPrefill as any).paidMonths.length} months`
+                            : 'month'}
+                        </p>
+                        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                          {(() => {
+                            const months: string[] = (editPrefill as any)?.paidMonths?.length
+                              ? (editPrefill as any).paidMonths
+                              : editPrefill?.billingMonth ? [editPrefill.billingMonth] : []
+                            return months.map(bm => {
+                              const [yr, ms] = bm.split('-')
+                              const label = `${MONTH_LABELS[parseInt(ms, 10) - 1]} ${yr}`
+                              return (
+                                <span key={bm} style={{ fontSize: 11, fontWeight: 700, color: '#1d4ed8', background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 5, padding: '2px 8px', whiteSpace: 'nowrap' }}>
+                                  {label}
+                                </span>
+                              )
+                            })
+                          })()}
+                        </div>
+                      </div>
+                      <span style={{ flexShrink: 0, fontSize: 10, color: '#94a3b8', fontWeight: 600, background: '#f1f5f9', border: '1px solid #e2e8f0', padding: '3px 8px', borderRadius: 6 }}>🔒 locked</span>
+                    </div>
+                    {/* Hint: how to change months */}
+                    <p style={{ margin: 0, fontSize: 11, color: '#64748b', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 7, padding: '7px 10px', lineHeight: 1.55 }}>
+                      ℹ️ <strong>To change which months this payment covers</strong>, delete this transaction and record a new one. This preserves your full audit history.
                     </p>
                   </div>
-                  <span style={{ marginLeft: 'auto', fontSize: 11, color: '#94a3b8', fontWeight: 500, background: '#f1f5f9', padding: '3px 8px', borderRadius: 6 }}>locked</span>
-                </div>
+
+                  {/* Live total preview */}
+                  <div style={{ padding: '10px 14px', borderRadius: 10, background: '#f0fdf4', border: '1px solid #86efac', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: 12, color: '#15803d', fontWeight: 600 }}>Total collected after save</span>
+                    <span style={{ fontSize: 18, fontWeight: 800, color: '#166534' }}>
+                      ₹{((Number(amount) || 0) + (Number(lateFee) || 0)).toLocaleString('en-IN')}
+                      {editPrefill && (Number(amount) || 0) + (Number(lateFee) || 0) !== editPrefill.amount && (
+                        <span style={{ fontSize: 11, color: '#94a3b8', fontWeight: 500, marginLeft: 8 }}>
+                          (was ₹{editPrefill.amount.toLocaleString('en-IN')})
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                </>
               ) : (
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
                   <ModalField label="Block" error={errors.block}>
@@ -575,20 +672,39 @@ function AddPaymentModal({
 }
 
 // ─── Delete Confirmation Modal ────────────────────────────────────────────────
+// Architecture rules implemented here:
+//  • Delete always voids the ENTIRE transaction — no "delete just one month"
+//  • Show exactly which months will revert to PENDING
+//  • Require a reason before confirming (adds friction + provides audit context)
+//  • Soft-delete language ("void" not "erase") to set correct expectations
+
+const DELETE_REASONS = [
+  'Duplicate entry',
+  'Wrong flat / block entered',
+  'Payment bounced / reversed',
+  'Data entry error',
+  'Other',
+]
 
 function DeleteModal({ open, payment, flatLabel, onClose, onConfirm }: {
   open: boolean; payment: Payment | null; flatLabel: string
   onClose: () => void; onConfirm: () => Promise<void>
 }) {
-  const [deleting, setDeleting] = useState(false)
-  const [error, setError]       = useState('')
-  useEffect(() => { if (open) { setDeleting(false); setError('') } }, [open])
+  const [deleting, setDeleting]     = useState(false)
+  const [error, setError]           = useState('')
+  const [reason, setReason]         = useState('')
+  const [showReasonDrop, setShowReasonDrop] = useState(false)
+  useEffect(() => { if (open) { setDeleting(false); setError(''); setReason('') } }, [open])
   if (!open || !payment) return null
 
-  const monthLabel   = MONTH_LABELS[(payment.month ?? 1) - 1]
-  const coveredCount = payment.paidMonths?.length ?? 1
+  const coveredMonths = payment.paidMonths?.length
+    ? payment.paidMonths.map(bm => { const [yr, ms] = bm.split('-'); return { bm, label: `${MONTH_LABELS[parseInt(ms,10)-1]} ${yr}` } })
+    : [{ bm: payment.billingMonth, label: MONTH_LABELS[(payment.month ?? 1) - 1] + ' 2026' }]
+  const coveredCount  = coveredMonths.length
+  const canConfirm    = reason.trim().length > 0 && !deleting
 
   const handleConfirm = async () => {
+    if (!reason.trim()) return
     setDeleting(true); setError('')
     try { await onConfirm() }
     catch (err: any) { setError(err?.message ?? 'Failed to delete. Please try again.'); setDeleting(false) }
@@ -597,51 +713,117 @@ function DeleteModal({ open, payment, flatLabel, onClose, onConfirm }: {
   return (
     <>
       <div onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(15,23,42,0.45)', backdropFilter: 'blur(4px)', animation: 'fadeIn 0.18s ease' }} />
-      <div style={{ position: 'fixed', zIndex: 1001, top: '50%', left: '50%', transform: 'translate(-50%,-50%)', width: '100%', maxWidth: 440, background: '#fff', borderRadius: 20, boxShadow: '0 24px 80px rgba(15,23,42,0.22)', animation: 'modalIn 0.22s cubic-bezier(0.34,1.56,0.64,1)', overflow: 'hidden' }}>
+      <div style={{ position: 'fixed', zIndex: 1001, top: '50%', left: '50%', transform: 'translate(-50%,-50%)', width: '100%', maxWidth: 460, background: '#fff', borderRadius: 20, boxShadow: '0 24px 80px rgba(15,23,42,0.22)', animation: 'modalIn 0.22s cubic-bezier(0.34,1.56,0.64,1)', overflow: 'hidden' }}>
+
+        {/* Header */}
         <div style={{ padding: '20px 24px 18px', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <div style={{ width: 36, height: 36, borderRadius: 10, background: '#fef2f2', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
               <Trash2 size={18} color="#dc2626" />
             </div>
             <div>
-              <p style={{ margin: 0, fontSize: 15, fontWeight: 800, color: '#0f172a' }}>Delete Payment</p>
-              <p style={{ margin: 0, fontSize: 11, color: '#94a3b8', fontWeight: 500 }}>This action cannot be undone</p>
+              <p style={{ margin: 0, fontSize: 15, fontWeight: 800, color: '#0f172a' }}>Delete Payment Transaction</p>
+              <p style={{ margin: 0, fontSize: 11, color: '#94a3b8', fontWeight: 500 }}>This will be voided and preserved in audit history</p>
             </div>
           </div>
           <button onClick={onClose} style={{ width: 32, height: 32, borderRadius: 8, border: '1px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
             <X size={15} color="#64748b" />
           </button>
         </div>
-        <div style={{ padding: '20px 24px' }}>
-          <div style={{ padding: '14px 16px', borderRadius: 10, background: '#fef2f2', border: '1px solid #fecaca', marginBottom: 16 }}>
-            <p style={{ margin: 0, fontSize: 13, color: '#7f1d1d', lineHeight: 1.65 }}>
-              You are about to permanently delete the <strong>{monthLabel} 2026</strong> payment of{' '}
-              <strong>₹{payment.amount.toLocaleString('en-IN')}</strong> for <strong>{flatLabel}</strong>.
-              {coveredCount > 1 && <> This transaction covers <strong>{coveredCount} months</strong> - all will be affected.</>}
+
+        <div style={{ padding: '18px 24px', display: 'flex', flexDirection: 'column', gap: 14 }}>
+
+          {/* Impact warning — which months revert to PENDING */}
+          <div style={{ padding: '12px 14px', borderRadius: 10, background: '#fef2f2', border: '1px solid #fecaca' }}>
+            <p style={{ margin: '0 0 8px', fontSize: 12, fontWeight: 700, color: '#b91c1c' }}>
+              ⚠️ {coveredCount === 1 ? '1 month' : `${coveredCount} months`} will revert to <strong>UNPAID</strong>
+            </p>
+            <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginBottom: 8 }}>
+              {coveredMonths.map(({ bm, label }) => (
+                <span key={bm} style={{ fontSize: 11, fontWeight: 700, color: '#dc2626', background: '#fff', border: '1.5px solid #fca5a5', borderRadius: 5, padding: '2px 8px' }}>
+                  {label}
+                </span>
+              ))}
+            </div>
+            <p style={{ margin: 0, fontSize: 11, color: '#7f1d1d', lineHeight: 1.55 }}>
+              <strong>{flatLabel}</strong> will reappear as unpaid for {coveredCount > 1 ? 'these months' : 'this month'}. The original receipt will be voided.
             </p>
           </div>
-          {[
-            ['Billing Month', `${monthLabel} 2026`],
-            ['Amount', `₹${payment.amount.toLocaleString('en-IN')}`],
-            ['Mode', payment.mode],
-            ['Date', payment.date],
-            ...(payment.notes ? [['Notes', payment.notes]] : []),
-          ].map(([k, v]) => (
-            <div key={k} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', borderBottom: '1px solid #f1f5f9', fontSize: 13 }}>
-              <span style={{ color: '#64748b', fontWeight: 600 }}>{k}</span>
-              <span style={{ color: '#0f172a', fontWeight: 700 }}>{v}</span>
+
+          {/* Transaction details */}
+          <div style={{ borderRadius: 10, border: '1px solid #e2e8f0', overflow: 'hidden' }}>
+            {[
+              ['Total amount', `₹${payment.amount.toLocaleString('en-IN')}`],
+              ['Mode', payment.mode],
+              ['Payment date', payment.date || '-'],
+              ...(payment.notes ? [['Notes', payment.notes]] : []),
+            ].map(([k, v], i, arr) => (
+              <div key={k} style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 14px', borderBottom: i < arr.length - 1 ? '1px solid #f1f5f9' : 'none', background: i % 2 === 0 ? '#fff' : '#fafbfc' }}>
+                <span style={{ fontSize: 12, color: '#64748b', fontWeight: 600 }}>{k}</span>
+                <span style={{ fontSize: 12, color: '#0f172a', fontWeight: 700 }}>{v}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Required reason — provides audit context and adds friction to prevent accidents */}
+          <div>
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#374151', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+              Reason for deletion <span style={{ color: '#dc2626' }}>*</span>
+            </label>
+            <div style={{ position: 'relative' }}>
+              <button
+                onClick={() => setShowReasonDrop(d => !d)}
+                style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', padding: '0 14px', height: 40, borderRadius: 8, border: `1.5px solid ${!reason && error ? '#fca5a5' : reason ? '#86efac' : '#e2e8f0'}`, background: '#fff', fontSize: 13, fontWeight: reason ? 600 : 400, color: reason ? '#0f172a' : '#94a3b8', cursor: 'pointer', textAlign: 'left' }}
+              >
+                <span>{reason || 'Select a reason…'}</span>
+                <ChevronDown size={14} color="#94a3b8" />
+              </button>
+              {showReasonDrop && (
+                <>
+                  <div style={{ position: 'fixed', inset: 0, zIndex: 10 }} onClick={() => setShowReasonDrop(false)} />
+                  <div style={{ position: 'absolute', top: '108%', left: 0, right: 0, zIndex: 20, background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10, boxShadow: '0 8px 24px rgba(15,23,42,0.1)', overflow: 'hidden' }}>
+                    {DELETE_REASONS.map(r => (
+                      <button key={r} onClick={() => { setReason(r); setShowReasonDrop(false) }}
+                        style={{ display: 'block', width: '100%', textAlign: 'left', padding: '9px 14px', fontSize: 13, cursor: 'pointer', border: 'none', background: r === reason ? '#fef2f2' : '#fff', color: r === reason ? '#dc2626' : '#0f172a', fontWeight: r === reason ? 700 : 400 }}
+                        onMouseEnter={e => { if (r !== reason) (e.currentTarget as HTMLElement).style.background = '#f8fafc' }}
+                        onMouseLeave={e => { if (r !== reason) (e.currentTarget as HTMLElement).style.background = '#fff' }}
+                      >{r}</button>
+                    ))}
+                  </div>
+                </>
+              )}
             </div>
-          ))}
+            {!reason && (
+              <p style={{ margin: '5px 0 0', fontSize: 11, color: '#94a3b8' }}>Required — stored in audit log for future reference</p>
+            )}
+          </div>
+
           {error && (
-            <div style={{ marginTop: 12, padding: '10px 14px', borderRadius: 8, background: '#fef2f2', border: '1px solid #fecaca', fontSize: 12, color: '#b91c1c', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ padding: '10px 14px', borderRadius: 8, background: '#fef2f2', border: '1px solid #fecaca', fontSize: 12, color: '#b91c1c', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 8 }}>
               <AlertCircle size={14} color="#dc2626" /> {error}
             </div>
           )}
         </div>
-        <div style={{ padding: '16px 24px', borderTop: '1px solid #f1f5f9', display: 'flex', justifyContent: 'flex-end', gap: 10, background: '#fafbfc' }}>
+
+        {/* Footer */}
+        <div style={{ padding: '14px 24px', borderTop: '1px solid #f1f5f9', display: 'flex', justifyContent: 'flex-end', gap: 10, background: '#fafbfc' }}>
           <button onClick={onClose} style={btnSecondaryStyle} disabled={deleting}>Cancel</button>
-          <button onClick={handleConfirm} disabled={deleting} style={{ ...btnDangerStyle, background: deleting ? '#fca5a5' : '#dc2626' }}>
-            {deleting ? <><Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} /> Deleting\u2026</> : <><Trash2 size={14} /> Delete Payment</>}
+          <button
+            onClick={handleConfirm}
+            disabled={!canConfirm}
+            title={!reason ? 'Select a reason to continue' : ''}
+            style={{
+              ...btnDangerStyle,
+              background: !canConfirm ? '#fca5a5' : deleting ? '#fca5a5' : '#dc2626',
+              cursor: canConfirm ? 'pointer' : 'not-allowed',
+              display: 'flex', alignItems: 'center', gap: 6,
+              opacity: !canConfirm ? 0.7 : 1,
+            }}
+          >
+            {deleting
+              ? <><Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} /> Deleting…</>
+              : <><Trash2 size={14} /> Void Transaction</>
+            }
           </button>
         </div>
       </div>
@@ -658,8 +840,10 @@ function FlatPanel({ open, flat, onClose, onAddPayment, onEditPayment, onDeleteP
   onDeletePayment: (f: Flat, p: Payment) => void
 }) {
   if (!open || !flat) return null
-  const anchorPmts  = flat.payments   // every payment is its own transaction
-  const totalPaid   = anchorPmts.reduce((s, p) => s + p.amount, 0)
+  // Only real transactions (isAnchorMonth=true); exclude heatmap-only clones
+  const anchorPmts    = flat.payments.filter(p => p.isAnchorMonth !== false)
+  const totalPaid     = anchorPmts.reduce((s, p) => s + p.amount, 0)
+  // Collect all paid month numbers across all transactions (including multi-month ones)
   const paidMonthNums = new Set(flat.payments.map(p => p.month))
 
   return (
@@ -676,7 +860,7 @@ function FlatPanel({ open, flat, onClose, onAddPayment, onEditPayment, onDeleteP
               </div>
               <div>
                 <p style={{ margin: 0, fontSize: 16, fontWeight: 800, color: '#0f172a' }}>{flat.block} \u00b7 Flat {flat.flat}</p>
-                <p style={{ margin: 0, fontSize: 11, color: '#94a3b8', fontWeight: 500 }}>{anchorPmts.length} transaction{anchorPmts.length !== 1 ? 's' : ''} recorded</p>
+                <p style={{ margin: 0, fontSize: 11, color: '#94a3b8', fontWeight: 500 }}>{anchorPmts.length} transaction{anchorPmts.length !== 1 ? 's' : ''} · {paidMonthNums.size} month{paidMonthNums.size !== 1 ? 's' : ''} covered</p>
               </div>
             </div>
             <button onClick={onClose} style={{ width: 32, height: 32, borderRadius: 8, border: '1px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
@@ -699,70 +883,171 @@ function FlatPanel({ open, flat, onClose, onAddPayment, onEditPayment, onDeleteP
           </div>
         </div>
 
-        {/* Month bar */}
+        {/* Mini heatmap — 2026 at a glance */}
         <div style={{ padding: '12px 24px 8px', borderBottom: '1px solid #f1f5f9', flexShrink: 0 }}>
           <p style={{ margin: '0 0 8px', fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em' }}>2026 at a glance</p>
           <div style={{ display: 'flex', gap: 3 }}>
             {MONTHS.map((m, i) => {
-              const paid = paidMonthNums.has(i + 1)
-              const pmt  = flat.payments.find(p => p.month === i + 1)
+              const paid   = paidMonthNums.has(i + 1)
+              const pmt    = flat.payments.find(p => p.month === i + 1)
               const online = pmt?.mode === 'ONLINE'
+              // Tooltip: status + transaction context, never a per-month split amount
+              const coveredLabels = pmt?.paidMonths?.map(bm => {
+                const [, ms] = bm.split('-')
+                return MONTH_LABELS[parseInt(ms, 10) - 1] ?? bm
+              })
+              const tipMulti = (coveredLabels?.length ?? 1) > 1 ? ` · covers ${coveredLabels!.join(' + ')}` : ''
+              const tip = paid
+                ? `${MONTH_LABELS[i]}: Paid ${pmt?.date ?? ''} · ₹${pmt?.transactionAmount?.toLocaleString('en-IN')} total · ${pmt?.mode}${tipMulti}`
+                : `${MONTH_LABELS[i]}: Not paid`
               return (
-                <div key={m} title={paid ? `${MONTH_LABELS[i]}: ₹${pmt?.amount?.toLocaleString('en-IN')} (${pmt?.mode})` : `${MONTH_LABELS[i]}: Not paid`}
-                  style={{ flex: 1, height: 28, borderRadius: 5, background: paid ? (online ? '#7c3aed18' : '#f59e0b18') : '#f1f5f9', border: `1.5px solid ${paid ? (online ? '#a78bfa' : '#fcd34d') : '#e2e8f0'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 8, fontWeight: 700, color: paid ? (online ? '#7c3aed' : '#d97706') : '#94a3b8' }}>
+                <div
+                  key={m} title={tip}
+                  onClick={() => paid && pmt && onEditPayment(flat, pmt)}
+                  style={{
+                    flex: 1, height: 28, borderRadius: 5, position: 'relative',
+                    background: paid ? (online ? '#ede9fe' : '#f0fdf4') : '#f1f5f9',
+                    border: `1.5px solid ${paid ? (online ? '#a78bfa' : '#86efac') : '#e2e8f0'}`,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 8, fontWeight: 700,
+                    color: paid ? (online ? '#7c3aed' : '#15803d') : '#94a3b8',
+                    cursor: paid ? 'pointer' : 'default',
+                    transition: 'transform 0.1s ease',
+                  }}
+                  onMouseEnter={e => { if (paid) (e.currentTarget as HTMLElement).style.transform = 'scale(1.1)' }}
+                  onMouseLeave={e => { (e.currentTarget as HTMLElement).style.transform = 'scale(1)' }}
+                >
+                  {/* Mode dot */}
+                  {paid && (
+                    <span style={{
+                      position: 'absolute', top: 2, right: 2,
+                      width: 4, height: 4, borderRadius: '50%',
+                      background: online ? '#7c3aed' : '#16a34a',
+                    }} />
+                  )}
                   {m.slice(0, 1)}
                 </div>
               )
             })}
           </div>
+          {/* Legend */}
+          <div style={{ display: 'flex', gap: 12, marginTop: 7, fontSize: 10, color: '#94a3b8' }}>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+              <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#16a34a', display: 'inline-block' }} />Cash
+            </span>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+              <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#7c3aed', display: 'inline-block' }} />Online
+            </span>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 3, marginLeft: 4, fontStyle: 'italic' }}>Click a paid cell to edit its transaction</span>
+          </div>
         </div>
 
-        {/* Transactions list */}
+        {/* Transaction ledger */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '16px 24px' }}>
-          {flat.payments.length === 0 ? (
+          <p style={{ margin: '0 0 10px', fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+            Transactions — {anchorPmts.length} record{anchorPmts.length !== 1 ? 's' : ''}
+          </p>
+          {anchorPmts.length === 0 ? (
             <div style={{ textAlign: 'center', padding: '40px 20px', color: '#94a3b8' }}>
               <Receipt size={36} style={{ margin: '0 auto 12px', opacity: 0.3, display: 'block' }} />
               <p style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>No payments yet</p>
               <p style={{ margin: '6px 0 0', fontSize: 12 }}>Record the first payment for this flat</p>
             </div>
           ) : (
-            anchorPmts.sort((a, b) => a.month - b.month).map(payment => {
-              const online = payment.mode === 'ONLINE'
-              const color  = online ? '#7c3aed' : '#d97706'
-              const bg     = online ? '#7c3aed12' : '#f59e0b12'
-              const count  = payment.paidMonths?.length ?? 1
-              return (
-                <div key={`${payment.billingMonth}-${payment.transactionId}`} style={{ padding: '14px 16px', borderRadius: 12, marginBottom: 10, background: '#fff', border: '1px solid #e2e8f0', display: 'flex', alignItems: 'center', gap: 12 }}>
-                  <div style={{ width: 48, height: 48, borderRadius: 10, background: bg, border: `1.5px solid ${color}30`, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                    <span style={{ fontSize: 11, fontWeight: 800, color, lineHeight: 1 }}>{MONTHS[(payment.month ?? 1) - 1]}</span>
-                    <span style={{ fontSize: 9, color: '#94a3b8', marginTop: 2 }}>2026</span>
-                  </div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                      <span style={{ fontSize: 16, fontWeight: 800, color: '#0f172a' }}>₹{payment.amount.toLocaleString('en-IN')}</span>
-                      {count > 1 && <span style={{ fontSize: 10, fontWeight: 700, color: '#7c3aed', background: '#7c3aed14', borderRadius: 4, padding: '2px 6px' }}>{count} months</span>}
+            anchorPmts
+              .slice()
+              .sort((a, b) => {
+                const parse = (d: string) => { const [dd,mm,yyyy] = d.split('/'); return new Date(+yyyy, +mm-1, +dd).getTime() }
+                return (b.date ? parse(b.date) : 0) - (a.date ? parse(a.date) : 0)
+              })
+              .map(payment => {
+                const online   = payment.mode === 'ONLINE'
+                const modeColor = online ? '#7c3aed' : '#d97706'
+                const modeBg    = online ? '#ede9fe'  : '#fef9c3'
+                const pmMonths  = payment.paidMonths?.length ? payment.paidMonths : [payment.billingMonth]
+                const pmLabels  = pmMonths.map(bm => {
+                  const [yr, ms] = bm.split('-')
+                  return `${MONTH_LABELS[parseInt(ms,10)-1]} ${yr}`
+                })
+                const isMulti  = pmLabels.length > 1
+                const txnRef   = payment.receiptNumber ?? payment.transactionRef ?? ''
+                return (
+                  <div key={payment.transactionId ?? payment.id}
+                    style={{ borderRadius: 12, marginBottom: 10, background: '#fff', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
+                    {/* Card header: months chips + locked badge */}
+                    <div style={{ padding: '10px 14px 8px', borderBottom: '1px solid #f8fafc', background: '#f8fafc', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
+                      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
+                        {pmLabels.map(label => (
+                          <span key={label} style={{ fontSize: 11, fontWeight: 700, color: '#1d4ed8', background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 5, padding: '2px 7px', whiteSpace: 'nowrap' }}>
+                            {label}
+                          </span>
+                        ))}
+                        {isMulti && (
+                          <span style={{ fontSize: 10, color: '#64748b', fontStyle: 'italic', marginLeft: 2 }}>
+                            · {pmLabels.length} months · 1 transaction
+                          </span>
+                        )}
+                      </div>
+                      {txnRef && (
+                        <span style={{ fontSize: 10, fontFamily: 'monospace', color: '#94a3b8', background: '#f1f5f9', borderRadius: 4, padding: '2px 6px', whiteSpace: 'nowrap' }}>
+                          {txnRef}
+                        </span>
+                      )}
                     </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 3, flexWrap: 'wrap' }}>
-                      <span style={{ fontSize: 10, fontWeight: 700, color, background: bg, borderRadius: 4, padding: '2px 6px' }}>{payment.mode}</span>
-                      {payment.date && <span style={{ fontSize: 11, color: '#94a3b8' }}>{payment.date}</span>}
+
+                    {/* Card body: amount + date + mode */}
+                    <div style={{ padding: '10px 14px 10px', display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                          <span style={{ fontSize: 18, fontWeight: 800, color: '#0f172a', letterSpacing: '-0.3px' }}>
+                            ₹{payment.amount.toLocaleString('en-IN')}
+                          </span>
+                          <span style={{ fontSize: 10, fontWeight: 700, color: modeColor, background: modeBg, borderRadius: 20, padding: '2px 8px' }}>
+                            {payment.mode}
+                          </span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 3 }}>
+                          {payment.date && (
+                            <span style={{ fontSize: 11, color: '#64748b' }}>{payment.date}</span>
+                          )}
+                          {payment.lateFee > 0 && (
+                            <span style={{ fontSize: 10, color: '#dc2626', fontWeight: 600, background: '#fef2f2', borderRadius: 4, padding: '1px 5px' }}>
+                              +₹{payment.lateFee} late fee
+                            </span>
+                          )}
+                        </div>
+                        {payment.notes && (
+                          <p style={{ margin: '5px 0 0', fontSize: 11, color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontStyle: 'italic' }}>
+                            "{payment.notes}"
+                          </p>
+                        )}
+                      </div>
+
+                      {/* Edit / Delete actions */}
+                      <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+                        <button
+                          onClick={() => onEditPayment(flat, payment)}
+                          title="Edit transaction (date, mode, amount, notes)"
+                          style={{ width: 32, height: 32, borderRadius: 8, border: '1.5px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', padding: 0, transition: 'all 0.12s ease' }}
+                          onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#f0fdf4'; el.style.borderColor = '#86efac' }}
+                          onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#fff'; el.style.borderColor = '#e2e8f0' }}
+                        >
+                          <Edit2 size={13} color="#64748b" />
+                        </button>
+                        <button
+                          onClick={() => onDeletePayment(flat, payment)}
+                          title={`Delete this transaction — ${pmLabels.length} month${pmLabels.length > 1 ? 's' : ''} will revert to unpaid`}
+                          style={{ width: 32, height: 32, borderRadius: 8, border: '1.5px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', padding: 0, transition: 'all 0.12s ease' }}
+                          onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#fef2f2'; el.style.borderColor = '#fca5a5' }}
+                          onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#fff'; el.style.borderColor = '#e2e8f0' }}
+                        >
+                          <Trash2 size={13} color="#94a3b8" />
+                        </button>
+                      </div>
                     </div>
-                    {payment.notes && <p style={{ margin: '4px 0 0', fontSize: 11, color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{payment.notes}</p>}
                   </div>
-                  <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
-                    <button onClick={() => onEditPayment(flat, payment)} title="Edit" style={{ width: 30, height: 30, borderRadius: 7, border: '1.5px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', padding: 0, transition: 'all 0.12s ease' }}
-                      onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#f0fdf4'; el.style.borderColor = '#86efac' }}
-                      onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#fff'; el.style.borderColor = '#e2e8f0' }}>
-                      <Edit2 size={13} color="#64748b" />
-                    </button>
-                    <button onClick={() => onDeletePayment(flat, payment)} title="Delete" style={{ width: 30, height: 30, borderRadius: 7, border: '1.5px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', padding: 0, transition: 'all 0.12s ease' }}
-                      onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#fef2f2'; el.style.borderColor = '#fca5a5' }}
-                      onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#fff'; el.style.borderColor = '#e2e8f0' }}>
-                      <Trash2 size={13} color="#94a3b8" />
-                    </button>
-                  </div>
-                </div>
-              )
-            })
+                )
+              })
           )}
         </div>
 
@@ -807,80 +1092,188 @@ function KpiCard({ icon, color, label, value, sub, pct, barColor, loading }: {
 }
 
 // ─── Payment Cell ─────────────────────────────────────────────────────────────
+// Architecture rule: cells show PAID/OVERDUE status only — never a per-month
+// split amount (₹400÷2=₹200 never existed as a DB record). Tooltip surfaces
+// the full transaction context. Click opens the parent transaction for editing.
 
 function PaymentCell({ payment, loading, onEdit }: { payment?: Payment; loading?: boolean; onEdit?: () => void }) {
   if (loading) return (
-    <td style={{ padding: '8px 4px', textAlign: 'center', borderBottom: '1px solid #f1f5f9' }}>
-      <div style={{ width: 48, height: 14, borderRadius: 4, background: '#f1f5f9', margin: '0 auto', animation: 'pulse 1.5s ease-in-out infinite' }} />
+    <td style={{ padding: '6px 2px', textAlign: 'center', borderBottom: '1px solid #f1f5f9' }}>
+      <div style={{ width: 42, height: 22, borderRadius: 6, background: '#f1f5f9', margin: '0 auto', animation: 'pulse 1.5s ease-in-out infinite' }} />
     </td>
   )
+
   if (!payment) return (
-    <td style={{ padding: '8px 4px', textAlign: 'center', borderBottom: '1px solid #f1f5f9', background: '#fff1f2' }}>
-      <span style={{ color: '#fca5a5', fontSize: 16, fontWeight: 700 }}>-</span>
+    <td style={{ padding: '6px 2px', textAlign: 'center', borderBottom: '1px solid #f1f5f9' }}>
+      <div style={{ margin: '0 auto', width: 42, height: 22, borderRadius: 6, background: '#f8fafc', border: '1.5px solid #e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <span style={{ color: '#cbd5e1', fontSize: 11, fontWeight: 700 }}>—</span>
+      </div>
     </td>
   )
-  const isOnline = payment.mode === 'ONLINE'
-  const color    = isOnline ? '#059669' : '#2563eb'
-  // All payments are now anchor rows (one transaction per month) — no sub-row rendering needed
+
+  const isOnline     = payment.mode === 'ONLINE'
+  const dotColor     = isOnline ? '#7c3aed' : '#16a34a'
   const coveredCount = payment.paidMonths?.length ?? 1
+  const isMultiMonth = coveredCount > 1
+
+  const coveredLabels = (payment.paidMonths ?? [payment.billingMonth]).map(bm => {
+    const [, ms] = bm.split('-')
+    return MONTH_LABELS[parseInt(ms, 10) - 1] ?? bm
+  })
+  // transactionAmount is the real total on both anchor and clone rows.
+  // payment.amount would be 0 on a clone — never use it for display.
+  const tooltipText = [
+    `Paid ${payment.date}`,
+    `₹${payment.transactionAmount.toLocaleString('en-IN')} total`,
+    payment.mode,
+    isMultiMonth ? `Covers: ${coveredLabels.join(' + ')}` : null,
+    payment.notes ? `Note: ${payment.notes}` : null,
+    'Click to view transaction',
+  ].filter(Boolean).join(' · ')
+
   return (
-    <td onClick={onEdit} title="Click to edit this payment"
-      style={{ padding: '6px 2px', textAlign: 'center', borderBottom: '1px solid #f1f5f9', background: '#f0fdf4', verticalAlign: 'top', cursor: onEdit ? 'pointer' : 'default', transition: 'background 0.12s ease' }}
-      onMouseEnter={e => { if (onEdit) (e.currentTarget as HTMLElement).style.background = '#dcfce7' }}
-      onMouseLeave={e => { if (onEdit) (e.currentTarget as HTMLElement).style.background = '#f0fdf4' }}>
-      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3 }}>
-        <span style={{ fontSize: 13, fontWeight: 700, color, whiteSpace: 'nowrap' }}>₹{payment.amount.toLocaleString('en-IN')}</span>
-        <span style={{ fontSize: 10, color: '#94a3b8' }}>{payment.date}</span>
-        {coveredCount > 1 && <span style={{ fontSize: 8, fontWeight: 700, color: '#7c3aed', background: '#7c3aed14', borderRadius: 4, padding: '1px 5px', whiteSpace: 'nowrap' }}>{coveredCount} months</span>}
-        <span style={{ fontSize: 9, fontWeight: 700, color, background: color + '14', borderRadius: 4, padding: '1px 5px' }}>{payment.mode}</span>
-        {onEdit && <span style={{ fontSize: 8, color: '#94a3b8', fontWeight: 500, marginTop: 1 }}>{'\u270e'} edit</span>}
+    <td
+      onClick={onEdit}
+      title={tooltipText}
+      style={{
+        padding: '5px 2px', textAlign: 'center',
+        borderBottom: '1px solid #f1f5f9',
+        cursor: onEdit ? 'pointer' : 'default',
+        transition: 'background 0.1s ease',
+      }}
+      onMouseEnter={e => { if (onEdit) (e.currentTarget as HTMLElement).style.background = '#f0fdf4' }}
+      onMouseLeave={e => { if (onEdit) (e.currentTarget as HTMLElement).style.background = '' }}
+    >
+      <div style={{
+        margin: '0 auto', width: 42,
+        borderRadius: 6,
+        background: '#dcfce7',
+        border: `1.5px solid ${isMultiMonth ? '#86efac' : '#a7f3d0'}`,
+        display: 'flex', flexDirection: 'column', alignItems: 'center',
+        gap: 0, padding: '3px 2px', position: 'relative', overflow: 'visible',
+      }}>
+        {/* Mode dot — top right */}
+        <span style={{
+          position: 'absolute', top: 2, right: 2,
+          width: 5, height: 5, borderRadius: '50%',
+          background: dotColor,
+          flexShrink: 0,
+        }} />
+        {/* PAID label */}
+        <span style={{ fontSize: 9, fontWeight: 800, color: '#15803d', letterSpacing: '0.04em' }}>PAID</span>
+        {/* Multi-month badge */}
+        {isMultiMonth && (
+          <span style={{
+            fontSize: 8, fontWeight: 700, color: '#7c3aed',
+            background: '#ede9fe', borderRadius: 3,
+            padding: '0 3px', lineHeight: '12px', whiteSpace: 'nowrap',
+          }}>{coveredCount}mo</span>
+        )}
       </div>
     </td>
   )
 }
 
 // ─── Calendar View ────────────────────────────────────────────────────────────
+// Architecture rule: one calendar event per PaymentTransaction, placed on the
+// payment date (processedAt). Multi-month transactions show ALL covered months
+// as chips. Amount shown is the real total, never a per-month split.
 
 function CalendarView({ flats, loading, onFlatClick }: { flats: Flat[]; loading: boolean; onFlatClick: (f: Flat) => void }) {
+  // Collect one entry per ANCHOR transaction. Since a multi-month transaction
+  // covers e.g. Jan+Feb, we place it in the calendar month matching its
+  // billingMonth (which is the anchor/earliest covered month).
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
       {MONTHS.map((mon, mi) => {
         const monthKey  = `2026-${String(mi + 1).padStart(2, '0')}`
-        const monthPmts = flats.flatMap(f => f.payments.filter(p => p.billingMonth === monthKey))
-        const total     = monthPmts.reduce((s, p) => s + p.amount, 0)
-        const online    = monthPmts.filter(p => p.mode === 'ONLINE').length
-        const cash      = monthPmts.filter(p => p.mode === 'CASH').length
+        // Only anchor rows whose billingMonth falls in this calendar slot
+        type AnchorRow = Payment & { flatRef: Flat }
+        const events: AnchorRow[] = loading ? [] : flats.flatMap(f =>
+          f.payments
+            .filter(p => p.isAnchorMonth !== false && p.billingMonth === monthKey)
+            .map(p => ({ ...p, flatRef: f }))
+        )
+        const totalCollected = events.reduce((s, e) => s + e.amount, 0)
+        const onlineCount    = events.filter(e => e.mode === 'ONLINE').length
+        const cashCount      = events.filter(e => e.mode === 'CASH').length
+
         return (
-          <div key={mon} style={{ borderRadius: 14, border: '1px solid #e2e8f0', background: '#fff', overflow: 'hidden' }}>
+          <div key={mon} style={{ borderRadius: 14, border: '1px solid #e2e8f0', background: '#fff', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            {/* Month header */}
             <div style={{ padding: '10px 14px 8px', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <span style={{ fontSize: 12, fontWeight: 800, color: '#0f172a', letterSpacing: '0.04em' }}>{mon}</span>
-              {total > 0 ? <span style={{ fontSize: 11, fontWeight: 700, color: '#16a34a' }}>₹{(total / 1000).toFixed(1)}K</span> : <span style={{ fontSize: 11, color: '#94a3b8' }}>₹0</span>}
-            </div>
-            <div style={{ padding: '8px 10px', display: 'flex', flexWrap: 'wrap', gap: 3, minHeight: 52 }}>
-              {loading
-                ? Array.from({ length: 6 }).map((_, i) => <div key={i} style={{ width: 24, height: 20, borderRadius: 4, background: '#f1f5f9', animation: 'pulse 1.5s ease-in-out infinite' }} />)
-                : flats.slice(0, 24).map(f => {
-                    const pmt = f.payments.find(p => p.billingMonth === monthKey)
-                    const isO = pmt?.mode === 'ONLINE'
-                    return (
-                      <div key={`${f.block}-${f.flat}`} onClick={() => onFlatClick(f)}
-                        title={`${f.block} / ${f.flat}${pmt ? ` \u00b7 ₹${pmt.amount.toLocaleString('en-IN')} (${pmt.mode})` : ' \u00b7 Unpaid'}`}
-                        style={{ width: 24, height: 20, borderRadius: 4, background: pmt ? (isO ? '#7c3aed18' : '#f59e0b18') : '#f1f5f9', border: `1px solid ${pmt ? (isO ? '#a78bfa' : '#fcd34d') : '#e2e8f0'}`, cursor: 'pointer', transition: 'transform 0.1s ease', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 8, fontWeight: 700, color: pmt ? (isO ? '#7c3aed' : '#d97706') : '#94a3b8' }}
-                        onMouseEnter={e => ((e.currentTarget as HTMLElement).style.transform = 'scale(1.18)')}
-                        onMouseLeave={e => ((e.currentTarget as HTMLElement).style.transform = 'scale(1)')}>
-                        {f.flat}
-                      </div>
-                    )
-                  })
+              {totalCollected > 0
+                ? <span style={{ fontSize: 11, fontWeight: 700, color: '#16a34a' }}>₹{(totalCollected / 1000).toFixed(1)}K</span>
+                : <span style={{ fontSize: 11, color: '#94a3b8' }}>₹0</span>
               }
-              {!loading && flats.length > 24 && <span style={{ fontSize: 9, color: '#94a3b8', alignSelf: 'center', fontWeight: 600 }}>+{flats.length - 24}</span>}
             </div>
-            <div style={{ padding: '6px 12px 10px', display: 'flex', gap: 10, fontSize: 10 }}>
+
+            {/* Event cards — one per transaction */}
+            <div style={{ padding: '8px 8px', display: 'flex', flexDirection: 'column', gap: 5, flex: 1, minHeight: 60 }}>
+              {loading
+                ? Array.from({ length: 3 }).map((_, i) => (
+                    <div key={i} style={{ height: 38, borderRadius: 7, background: '#f1f5f9', animation: 'pulse 1.5s ease-in-out infinite' }} />
+                  ))
+                : events.length === 0
+                  ? <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, color: '#e2e8f0', fontSize: 11, fontWeight: 600, paddingBottom: 8 }}>No payments</div>
+                  : events.slice(0, 8).map(ev => {
+                      const isOnline = ev.mode === 'ONLINE'
+                      const borderCol = isOnline ? '#a78bfa' : '#86efac'
+                      const bgCol     = isOnline ? '#faf5ff' : '#f0fdf4'
+                      // All covered months as chips — the KEY visual: one card, multiple month chips
+                      const coveredChips = (ev.paidMonths?.length ? ev.paidMonths : [ev.billingMonth]).map(bm => {
+                        const [, ms] = bm.split('-')
+                        return MONTH_LABELS[parseInt(ms, 10) - 1] ?? bm
+                      })
+                      const isMulti = coveredChips.length > 1
+                      return (
+                        <div
+                          key={ev.transactionId ?? ev.id}
+                          onClick={() => onFlatClick(ev.flatRef)}
+                          title={`${ev.flatRef.block} / ${ev.flatRef.flat} · ₹${ev.amount.toLocaleString('en-IN')} · ${ev.mode}${isMulti ? ' · Multi-month: ' + coveredChips.join('+') : ''} · Click to view`}
+                          style={{ padding: '7px 9px', borderRadius: 8, background: bgCol, border: `1.5px solid ${borderCol}`, cursor: 'pointer', transition: 'transform 0.1s ease' }}
+                          onMouseEnter={e => ((e.currentTarget as HTMLElement).style.transform = 'scale(1.02)')}
+                          onMouseLeave={e => ((e.currentTarget as HTMLElement).style.transform = 'scale(1)')}
+                        >
+                          {/* Row 1: amount + mode */}
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                            <span style={{ fontSize: 12, fontWeight: 800, color: '#0f172a' }}>
+                              ₹{ev.amount.toLocaleString('en-IN')}
+                            </span>
+                            <span style={{ fontSize: 9, fontWeight: 700, color: isOnline ? '#7c3aed' : '#16a34a', background: isOnline ? '#ede9fe' : '#dcfce7', borderRadius: 4, padding: '1px 5px' }}>
+                              {ev.mode}
+                            </span>
+                          </div>
+                          {/* Row 2: month chips (THE key architecture rule — show all covered months) */}
+                          <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap', marginBottom: 3 }}>
+                            {coveredChips.map(chip => (
+                              <span key={chip} style={{ fontSize: 9, fontWeight: 700, color: '#1d4ed8', background: '#dbeafe', borderRadius: 3, padding: '1px 4px', whiteSpace: 'nowrap' }}>{chip}</span>
+                            ))}
+                          </div>
+                          {/* Row 3: flat + date */}
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <span style={{ fontSize: 10, color: '#64748b', fontWeight: 600 }}>{ev.flatRef.block} / {ev.flatRef.flat}</span>
+                            {ev.date && <span style={{ fontSize: 9, color: '#94a3b8' }}>{ev.date}</span>}
+                          </div>
+                        </div>
+                      )
+                    })
+              }
+              {!loading && events.length > 8 && (
+                <div style={{ fontSize: 10, color: '#94a3b8', fontWeight: 600, textAlign: 'center', padding: '3px 0' }}>
+                  +{events.length - 8} more
+                </div>
+              )}
+            </div>
+
+            {/* Footer counts */}
+            <div style={{ padding: '6px 12px 10px', display: 'flex', gap: 10, fontSize: 10, borderTop: events.length > 0 ? '1px solid #f1f5f9' : 'none' }}>
               <span style={{ display: 'flex', alignItems: 'center', gap: 3, color: '#7c3aed', fontWeight: 600 }}>
-                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#a78bfa', display: 'inline-block' }} />{online} online
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#a78bfa', display: 'inline-block' }} />{onlineCount} online
               </span>
               <span style={{ display: 'flex', alignItems: 'center', gap: 3, color: '#d97706', fontWeight: 600 }}>
-                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#fcd34d', display: 'inline-block' }} />{cash} cash
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#fcd34d', display: 'inline-block' }} />{cashCount} cash
               </span>
             </div>
           </div>
@@ -892,21 +1285,32 @@ function CalendarView({ flats, loading, onFlatClick }: { flats: Flat[]; loading:
 
 // ─── Recent Transactions ──────────────────────────────────────────────────────
 
-function RecentView({ flats, loading, onEdit, onDelete }: { flats: Flat[]; loading: boolean; onEdit: (f: Flat, p: Payment) => void; onDelete: (f: Flat, p: Payment) => void }) {
+// ─── Transaction History (Ledger) ─────────────────────────────────────────────
+// Architecture rule: one row per PaymentTransaction. The "Covers months" column
+// with chips is the primary UX fix — it makes multi-month transactions obvious
+// and prevents admins from assuming ₹400 is two separate ₹200 payments.
+
+function RecentView({ flats, loading, onEdit, onDelete }: {
+  flats: Flat[]; loading: boolean
+  onEdit: (f: Flat, p: Payment) => void
+  onDelete: (f: Flat, p: Payment) => void
+}) {
   type Row = Payment & { flatRef: Flat }
   const rows: Row[] = useMemo(() =>
-    flats.flatMap(f => f.payments.map(p => ({ ...p, flatRef: f })))
-      .filter(p => p.isAnchorMonth !== false)   // always true now; kept for type safety
-      .sort((a, b) => {
-        const parse = (d: string) => { const [dd,mm,yyyy] = d.split('/'); return new Date(Number(yyyy), Number(mm)-1, Number(dd)).getTime() }
-        return (b.date ? parse(b.date) : 0) - (a.date ? parse(a.date) : 0)
-      })
+    flats.flatMap(f =>
+      f.payments
+        .filter(p => p.isAnchorMonth !== false)   // anchor rows only — no heatmap clones
+        .map(p => ({ ...p, flatRef: f }))
+    ).sort((a, b) => {
+      const parse = (d: string) => { const [dd,mm,yyyy] = d.split('/'); return new Date(+yyyy, +mm-1, +dd).getTime() }
+      return (b.date ? parse(b.date) : 0) - (a.date ? parse(a.date) : 0)
+    })
   , [flats])
 
   if (loading) return (
     <div style={{ padding: '48px', textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>
       <Loader2 size={24} style={{ animation: 'spin 1s linear infinite', margin: '0 auto 10px', display: 'block' }} />
-      Loading transactions\u2026
+      Loading transactions…
     </div>
   )
   if (rows.length === 0) return (
@@ -921,41 +1325,118 @@ function RecentView({ flats, loading, onEdit, onDelete }: { flats: Flat[]; loadi
       <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
         <thead>
           <tr style={{ background: '#0f172a' }}>
-            {[['Date','10%'],['Block','12%'],['Flat','7%'],['Month','8%'],['Amount','11%'],['Mode','9%'],['Notes','auto'],['','9%']].map(([h,w]) => (
-              <th key={h} style={{ padding: '10px 10px', textAlign: h === 'Amount' ? 'right' : h === 'Month' ? 'center' : 'left', fontSize: 10, fontWeight: 700, color: '#94a3b8', letterSpacing: '0.06em', textTransform: 'uppercase', width: w }}>{h}</th>
+            {[
+              ['Date',          '10%'],
+              ['Block',         '11%'],
+              ['Flat',           '7%'],
+              ['Covers months', '20%'],   // THE key column — chips show all months per transaction
+              ['Amount',        '10%'],
+              ['Late fee',       '8%'],
+              ['Mode',           '9%'],
+              ['Ref',           '12%'],
+              ['Notes',         'auto'],
+              ['',               '8%'],
+            ].map(([h, w]) => (
+              <th key={h} style={{
+                padding: '10px 10px',
+                textAlign: h === 'Amount' || h === 'Late fee' ? 'right' : h === 'Covers months' ? 'center' : 'left',
+                fontSize: 10, fontWeight: 700, color: h === 'Covers months' ? '#34d399' : '#94a3b8',
+                letterSpacing: '0.06em', textTransform: 'uppercase', width: w,
+              }}>{h}</th>
             ))}
           </tr>
         </thead>
         <tbody>
           {rows.slice(0, 120).map(({ flatRef, ...payment }, idx) => {
-            const online = payment.mode === 'ONLINE'
-            const color  = online ? '#7c3aed' : '#d97706'
-            const count  = payment.paidMonths?.length ?? 1
+            const isOnline    = payment.mode === 'ONLINE'
+            const modeColor   = isOnline ? '#7c3aed' : '#d97706'
+            // Covered months chips — the architectural fix for multi-month confusion
+            const coveredBms  = payment.paidMonths?.length ? payment.paidMonths : [payment.billingMonth]
+            const chipLabels  = coveredBms.map(bm => {
+              const [yr, ms] = bm.split('-')
+              return { bm, label: `${MONTH_LABELS[parseInt(ms, 10) - 1]} ${yr}` }
+            })
+            const isMulti     = chipLabels.length > 1
+            const txnRef      = payment.receiptNumber ?? payment.transactionRef ?? ''
+            const deleteTip   = `Delete transaction — ${chipLabels.length} month${chipLabels.length > 1 ? 's' : ''} (${chipLabels.map(c => c.label).join(', ')}) will revert to unpaid`
+
             return (
-              <tr key={`${payment.billingMonth}-${idx}`} style={{ background: idx % 2 === 0 ? '#fff' : '#fafbfc' }}>
-                <td style={{ padding: '10px 10px', fontSize: 12, color: '#64748b', borderBottom: '1px solid #f1f5f9' }}>{payment.date || '-'}</td>
-                <td style={{ padding: '10px 10px', fontSize: 12, color: '#64748b', borderBottom: '1px solid #f1f5f9', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{flatRef.block}</td>
-                <td style={{ padding: '10px 10px', fontSize: 12, fontWeight: 700, color: '#0f172a', borderBottom: '1px solid #f1f5f9' }}>{flatRef.flat}</td>
-                <td style={{ padding: '10px 10px', textAlign: 'center', borderBottom: '1px solid #f1f5f9' }}>
-                  <span style={{ fontSize: 10, fontWeight: 700, color, background: color + '14', borderRadius: 4, padding: '2px 6px' }}>
-                    {MONTHS[(payment.month ?? 1) - 1]}{count > 1 ? ` +${count - 1}` : ''}
+              <tr key={`${payment.transactionId ?? payment.id}-${idx}`}
+                style={{ background: idx % 2 === 0 ? '#fff' : '#fafbfc' }}>
+
+                <td style={{ padding: '10px 10px', fontSize: 12, color: '#64748b', borderBottom: '1px solid #f1f5f9', whiteSpace: 'nowrap' }}>
+                  {payment.date || '-'}
+                </td>
+                <td style={{ padding: '10px 10px', fontSize: 12, color: '#64748b', borderBottom: '1px solid #f1f5f9', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {flatRef.block}
+                </td>
+                <td style={{ padding: '10px 10px', fontSize: 12, fontWeight: 700, color: '#0f172a', borderBottom: '1px solid #f1f5f9' }}>
+                  {flatRef.flat}
+                </td>
+
+                {/* THE key column — month chips make multi-month nature obvious */}
+                <td style={{ padding: '7px 10px', borderBottom: '1px solid #f1f5f9' }}>
+                  <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap', alignItems: 'center' }}>
+                    {chipLabels.map(({ bm, label }) => (
+                      <span key={bm} style={{
+                        fontSize: 10, fontWeight: 700,
+                        color: '#1d4ed8', background: '#eff6ff',
+                        border: '1px solid #bfdbfe',
+                        borderRadius: 4, padding: '2px 6px', whiteSpace: 'nowrap',
+                      }}>{label}</span>
+                    ))}
+                    {isMulti && (
+                      <span style={{ fontSize: 9, color: '#94a3b8', fontStyle: 'italic', whiteSpace: 'nowrap' }}>
+                        · 1 txn
+                      </span>
+                    )}
+                  </div>
+                </td>
+
+                {/* Real total amount — never a per-month split */}
+                <td style={{ padding: '10px 10px', textAlign: 'right', fontSize: 13, fontWeight: 800, color: '#0f172a', borderBottom: '1px solid #f1f5f9', whiteSpace: 'nowrap' }}>
+                  ₹{payment.amount.toLocaleString('en-IN')}
+                </td>
+
+                <td style={{ padding: '10px 10px', textAlign: 'right', fontSize: 12, color: payment.lateFee > 0 ? '#dc2626' : '#94a3b8', fontWeight: payment.lateFee > 0 ? 700 : 400, borderBottom: '1px solid #f1f5f9', whiteSpace: 'nowrap' }}>
+                  {payment.lateFee > 0 ? `₹${payment.lateFee.toLocaleString('en-IN')}` : '—'}
+                </td>
+
+                <td style={{ padding: '10px 10px', borderBottom: '1px solid #f1f5f9' }}>
+                  <span style={{ fontSize: 10, fontWeight: 700, color: modeColor, background: modeColor + '14', borderRadius: 20, padding: '3px 8px', whiteSpace: 'nowrap' }}>
+                    {payment.mode}
                   </span>
                 </td>
-                <td style={{ padding: '10px 10px', textAlign: 'right', fontSize: 13, fontWeight: 700, color: '#0f172a', borderBottom: '1px solid #f1f5f9', whiteSpace: 'nowrap' }}>₹{payment.amount.toLocaleString('en-IN')}</td>
-                <td style={{ padding: '10px 10px', borderBottom: '1px solid #f1f5f9' }}>
-                  <span style={{ fontSize: 10, fontWeight: 700, color, background: color + '14', borderRadius: 20, padding: '3px 8px' }}>{payment.mode}</span>
+
+                <td style={{ padding: '10px 10px', borderBottom: '1px solid #f1f5f9', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {txnRef
+                    ? <span style={{ fontSize: 10, fontFamily: 'monospace', color: '#64748b', background: '#f1f5f9', borderRadius: 4, padding: '2px 5px' }}>{txnRef}</span>
+                    : <span style={{ color: '#cbd5e1', fontSize: 11 }}>—</span>
+                  }
                 </td>
-                <td style={{ padding: '10px 10px', fontSize: 11, color: '#64748b', borderBottom: '1px solid #f1f5f9', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{payment.notes || '-'}</td>
+
+                <td style={{ padding: '10px 10px', fontSize: 11, color: '#64748b', borderBottom: '1px solid #f1f5f9', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontStyle: payment.notes ? 'italic' : 'normal' }}>
+                  {payment.notes || '—'}
+                </td>
+
                 <td style={{ padding: '8px 8px', textAlign: 'center', borderBottom: '1px solid #f1f5f9' }}>
                   <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
-                    <button onClick={() => onEdit(flatRef, payment)} title="Edit" style={{ width: 26, height: 26, borderRadius: 6, border: '1.5px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', padding: 0 }}
+                    <button
+                      onClick={() => onEdit(flatRef, payment)}
+                      title="Edit transaction (date, mode, amount, notes)"
+                      style={{ width: 26, height: 26, borderRadius: 6, border: '1.5px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', padding: 0 }}
                       onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#f0fdf4'; el.style.borderColor = '#86efac' }}
-                      onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#fff'; el.style.borderColor = '#e2e8f0' }}>
+                      onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#fff'; el.style.borderColor = '#e2e8f0' }}
+                    >
                       <Edit2 size={11} color="#64748b" />
                     </button>
-                    <button onClick={() => onDelete(flatRef, payment)} title="Delete" style={{ width: 26, height: 26, borderRadius: 6, border: '1.5px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', padding: 0 }}
+                    <button
+                      onClick={() => onDelete(flatRef, payment)}
+                      title={deleteTip}
+                      style={{ width: 26, height: 26, borderRadius: 6, border: '1.5px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', padding: 0 }}
                       onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#fef2f2'; el.style.borderColor = '#fca5a5' }}
-                      onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#fff'; el.style.borderColor = '#e2e8f0' }}>
+                      onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.background = '#fff'; el.style.borderColor = '#e2e8f0' }}
+                    >
                       <Trash2 size={11} color="#94a3b8" />
                     </button>
                   </div>
@@ -965,6 +1446,11 @@ function RecentView({ flats, loading, onEdit, onDelete }: { flats: Flat[]; loadi
           })}
         </tbody>
       </table>
+      {rows.length > 120 && (
+        <div style={{ padding: '12px 16px', background: '#fafbfc', borderTop: '1px solid #f1f5f9', textAlign: 'center', fontSize: 12, color: '#94a3b8' }}>
+          Showing 120 of {rows.length} transactions
+        </div>
+      )}
     </div>
   )
 }
@@ -1039,16 +1525,21 @@ export default function PaymentsPage() {
     setEditPrefillBlock(f.block); setEditPrefillFlat(f.flat)
     const now = new Date()
     const pad2 = (n: number) => String(n).padStart(2, '0')
-    // payment.date is dd/mm/yyyy — reconstruct as a datetime-local string at noon IST
-    // (exact time is unavailable from the history summary; noon is a neutral default)
+    // payment.date is already formatted as dd/mm/yyyy by fmtDate().
+    // Reconstruct a datetime-local string for the input; use noon IST as time since
+    // we only have the date portion.
     const paidAtStr = payment.date
       ? (() => { const [d,m,y] = payment.date.split('/'); return `${y}-${m}-${d}T12:00` })()
       : `${now.getFullYear()}-${pad2(now.getMonth()+1)}-${pad2(now.getDate())}T${pad2(now.getHours())}:${pad2(now.getMinutes())}`
+    // payment.amount is the TOTAL transaction amount (real figure from API — no division)
+    // Use the anchor billingMonth (earliest covered month) as the display month
+    const anchorBillingMonth = payment.paidMonths?.length ? payment.paidMonths[0] : payment.billingMonth
     setEditPrefill({
       amount: payment.amount, lateFee: 0, mode: payment.mode,
       paidAt: paidAtStr,
-      notes: payment.notes ?? '', billingMonth: payment.billingMonth,
-    })
+      notes: payment.notes ?? '', billingMonth: anchorBillingMonth,
+      paidMonths: payment.paidMonths?.length ? payment.paidMonths : [anchorBillingMonth],
+    } as any)
     setEditModalOpen(true)
   }
 
@@ -1064,16 +1555,23 @@ export default function PaymentsPage() {
   }
 
   const handleDeleteConfirm = async () => {
-    if (!deletePayment?.transactionId && !deletePayment?.id)
-      throw new Error('Payment ID missing. Please refresh and try again.')
-    await api.deletePayment((deletePayment.transactionId ?? deletePayment.id)!)
+    // Single DELETE on the master PaymentTransaction id.
+    // The server atomically resets all covered MaintenancePayment rows,
+    // deletes the receipt, and posts the fund ledger reversal — no loop needed.
+    const id = deletePayment?.transactionId ?? deletePayment?.id
+    if (!id) throw new Error('Payment ID missing. Please refresh and try again.')
+    await api.deletePayment(id)
     setDeleteOpen(false)
-    setToast({ message: 'Payment deleted successfully.', type: 'success' })
+    const monthCount = deletePayment?.paidMonths?.length ?? 1
+    setToast({ message: `Transaction voided — ${monthCount} month${monthCount > 1 ? 's' : ''} reverted to unpaid.`, type: 'success' })
     await loadAll()
   }
 
   const allLoading       = globalLoading
-  const allPayments      = flats.flatMap(f => f.payments)
+  // Only anchor rows (isAnchorMonth=true) are real transactions.
+  // Heatmap clones (isAnchorMonth=false) are expansions of multi-month transactions
+  // and must be excluded from totals to avoid double-counting.
+  const allPayments      = flats.flatMap(f => f.payments.filter(p => p.isAnchorMonth !== false))
   const totalCollection  = allPayments.reduce((s, p) => s + p.amount, 0)
   const onlineCollection = allPayments.filter(p => p.mode === 'ONLINE').reduce((s, p) => s + p.amount, 0)
   const cashCollection   = totalCollection - onlineCollection
@@ -1086,9 +1584,25 @@ export default function PaymentsPage() {
   const collectedPct     = Math.min(Math.round((totalCollection / yearTarget) * 100), 100)
   const fmt              = (n: number) => '₹' + n.toLocaleString('en-IN')
 
+  // monthStats: per-column totals shown in the heatmap header row.
+  // Rules:
+  //  • Only anchor rows (isAnchorMonth !== false) represent real money.
+  //  • A multi-month transaction (e.g. ₹400 for Jan+Feb) contributes its FULL
+  //    totalAmount to the month of the anchor row (Jan), and ₹0 to the clone
+  //    months (Feb). This correctly reflects that the ₹400 was collected once.
+  //  • Clone rows have amount=0 so even an unfiltered sum stays correct.
   const monthStats = useMemo(() => MONTHS.map((_, mi) => {
-    const monthIdx = mi + 1; let total = 0; let count = 0
-    flats.forEach(f => { const p = f.payments.find(p => p.month === monthIdx); if (p) { total += p.amount; count++ } })
+    const monthIdx = mi + 1
+    let total = 0; let count = 0
+    flats.forEach(f => {
+      // Find the payment for this month — could be an anchor or a clone
+      const p = f.payments.find(p => p.month === monthIdx)
+      if (!p) return
+      count++
+      // Only add money for anchor rows; clones already carry amount=0 but
+      // we guard explicitly so the intent is clear.
+      if (p.isAnchorMonth !== false) total += p.amount
+    })
     return { total, flats: count }
   }), [flats])
 
@@ -1251,7 +1765,7 @@ export default function PaymentsPage() {
                       if (f.block !== lastBlock) {
                         lastBlock = f.block
                         const blockFlats = filtered.filter(x => x.block === f.block)
-                        const blockTotal = blockFlats.reduce((s, x) => s + x.payments.reduce((a, p) => a + p.amount, 0), 0)
+                        const blockTotal = blockFlats.reduce((s, x) => s + x.payments.filter(p => p.isAnchorMonth !== false).reduce((a, p) => a + p.amount, 0), 0)
                         const blockPaid  = blockFlats.filter(x => x.payments.length > 0).length
                         rows.push(
                           <tr key={`sep-${f.block}`} style={{ background: '#1e293b' }}>
@@ -1266,7 +1780,7 @@ export default function PaymentsPage() {
                           </tr>
                         )
                       }
-                      const total   = f.payments.reduce((s, p) => s + p.amount, 0)
+                      const total   = f.payments.filter(p => p.isAnchorMonth !== false).reduce((s, p) => s + p.amount, 0)
                       const flatKey = `${f.block}-${f.flat}`
                       rows.push(
                         <tr key={flatKey} style={{ background: '#fff', animation: highlightedFlat === flatKey ? 'rowHighlight 3s ease' : undefined }}>
@@ -1274,7 +1788,9 @@ export default function PaymentsPage() {
                           <td style={{ padding: '8px 6px', fontSize: 11, fontWeight: 700, color: '#0f172a', borderBottom: '1px solid #f1f5f9' }}>{f.flat}</td>
                           {MONTHS.map((_, mi) => {
                             const p = f.payments.find(p => p.month === mi + 1)
-                            return <PaymentCell key={mi} payment={p} onEdit={p ? () => openEditModal(f, p) : undefined} />
+                            // Architecture: clicking a paid cell opens the FlatPanel (navigates to parent
+                            // transaction), not a month-level edit. The month is not independently editable.
+                            return <PaymentCell key={mi} payment={p} onEdit={p ? () => openFlatPanel(f) : undefined} />
                           })}
                           <td style={{ padding: '8px 6px', textAlign: 'right', fontSize: 11, fontWeight: 700, color: total > 0 ? '#0f172a' : '#94a3b8', borderBottom: '1px solid #f1f5f9', whiteSpace: 'nowrap' }}>
                             {total > 0 ? `₹${total.toLocaleString('en-IN')}` : '₹0'}
