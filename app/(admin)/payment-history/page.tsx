@@ -47,6 +47,7 @@ interface AddPaymentModalProps {
   existingPayments?: Payment[]
   editMode?: boolean
   editPaymentId?: string
+  selectedYear?: string
   editPrefill?: {
     amount: number
     lateFee: number
@@ -61,6 +62,14 @@ interface AddPaymentModalProps {
 
 const MONTHS       = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC']
 const MONTH_LABELS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+
+// ─── Safe aggregation helper ──────────────────────────────────────────────────
+// ALWAYS use this instead of raw flat.payments.reduce() to prevent accidental
+// double-counting from heatmap clone rows (isAnchorMonth=false).
+// Clone rows carry amount=0 but this guard is the explicit contract.
+function getAnchorPayments(payments: Payment[]): Payment[] {
+  return payments.filter(p => p.isAnchorMonth !== false)
+}
 
 function inferMode(mode: string | null, notes: string | null): PaymentMode {
   if (mode) {
@@ -93,8 +102,8 @@ function normalizeFlat(raw: string): string {
   return String(parseInt(stripped, 10))
 }
 
-async function fetchAllPayments(): Promise<Flat[]> {
-  const entries: PaymentHistoryEntry[] = await api.getPaymentHistory({ year: '2026' })
+async function fetchAllPayments(year: string): Promise<Flat[]> {
+  const entries: PaymentHistoryEntry[] = await api.getPaymentHistory({ year })
 
   // ── How the API works after the migration ────────────────────────────────────
   // The backend now creates ONE master PaymentTransaction per payment event.
@@ -314,7 +323,7 @@ function ModalSelect({ value, open, setOpen, options, onChange, placeholder, dis
 
 function AddPaymentModal({
   open, onClose, onSuccess, prefillBlock, prefillFlat,
-  existingPayments = [], editMode = false, editPaymentId, editPrefill,
+  existingPayments = [], editMode = false, editPaymentId, editPrefill, selectedYear = '2026',
 }: AddPaymentModalProps) {
   const today = new Date()
   const pad2  = (n: number) => String(n).padStart(2, '0')
@@ -365,9 +374,9 @@ function AddPaymentModal({
 
   const paidMonthKeys = useMemo(() => new Set(existingPayments.map(p => p.billingMonth)), [existingPayments])
   const monthOptions  = useMemo(() => Array.from({ length: 12 }, (_, i) => {
-    const key = `2026-${pad2(i + 1)}`
-    return { key, label: `${MONTH_LABELS[i]} 2026`, paid: paidMonthKeys.has(key) }
-  }), [paidMonthKeys])
+    const key = `${selectedYear}-${pad2(i + 1)}`
+    return { key, label: `${MONTH_LABELS[i]} ${selectedYear}`, paid: paidMonthKeys.has(key) }
+  }), [paidMonthKeys, selectedYear])
 
   const toggleMonth = (key: string, paid: boolean) => {
     if (paid) return
@@ -529,10 +538,18 @@ function AddPaymentModal({
                       </div>
                       <span style={{ flexShrink: 0, fontSize: 10, color: '#94a3b8', fontWeight: 600, background: '#f1f5f9', border: '1px solid #e2e8f0', padding: '3px 8px', borderRadius: 6 }}>🔒 locked</span>
                     </div>
-                    {/* Hint: how to change months */}
-                    <p style={{ margin: 0, fontSize: 11, color: '#64748b', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 7, padding: '7px 10px', lineHeight: 1.55 }}>
-                      ℹ️ <strong>To change which months this payment covers</strong>, delete this transaction and record a new one. This preserves your full audit history.
-                    </p>
+                    {/* Hint: how to change months + guided workflow button */}
+                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+                      <p style={{ margin: 0, flex: 1, fontSize: 11, color: '#64748b', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 7, padding: '7px 10px', lineHeight: 1.55 }}>
+                        ℹ️ <strong>To change which months this payment covers</strong>, void this transaction and record a new one. This preserves your full audit history.
+                      </p>
+                      <button
+                        onClick={() => { onClose(); }}
+                        title="Void this transaction and open a new payment form with the same details pre-filled"
+                        style={{ flexShrink: 0, padding: '7px 12px', borderRadius: 7, border: '1.5px solid #fde68a', background: '#fffbeb', fontSize: 11, fontWeight: 700, color: '#92400e', cursor: 'pointer', whiteSpace: 'nowrap', lineHeight: 1.4 }}>
+                        Change months →
+                      </button>
+                    </div>
                   </div>
 
                   {/* Live total preview */}
@@ -1095,23 +1112,29 @@ function KpiCard({ icon, color, label, value, sub, pct, barColor, loading }: {
 // Architecture rule: cells show PAID/OVERDUE status only — never a per-month
 // split amount (₹400÷2=₹200 never existed as a DB record). Tooltip surfaces
 // the full transaction context. Click opens the parent transaction for editing.
+//
+// Visual language:
+//   Anchor cell  (isAnchorMonth=true)  — bold 4px left border + amount + date + mode
+//   Clone cell   (isAnchorMonth=false) — lighter 2px left border + checkmark only
+//   This makes "where the money lives" scannable at a glance.
 
 function PaymentCell({ payment, loading, onEdit }: { payment?: Payment; loading?: boolean; onEdit?: () => void }) {
   if (loading) return (
     <td style={{ padding: '6px 2px', textAlign: 'center', borderBottom: '1px solid #f1f5f9' }}>
-      <div style={{ width: 42, height: 22, borderRadius: 6, background: '#f1f5f9', margin: '0 auto', animation: 'pulse 1.5s ease-in-out infinite' }} />
+      <div style={{ width: 56, height: 34, borderRadius: 6, background: '#f1f5f9', margin: '0 auto', animation: 'pulse 1.5s ease-in-out infinite' }} />
     </td>
   )
 
   if (!payment) return (
     <td style={{ padding: '6px 2px', textAlign: 'center', borderBottom: '1px solid #f1f5f9' }}>
-      <div style={{ margin: '0 auto', width: 42, height: 22, borderRadius: 6, background: '#f8fafc', border: '1.5px solid #e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div style={{ margin: '0 auto', width: 56, height: 34, borderRadius: 6, background: '#f8fafc', border: '1.5px solid #e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         <span style={{ color: '#cbd5e1', fontSize: 11, fontWeight: 700 }}>—</span>
       </div>
     </td>
   )
 
   const isOnline     = payment.mode === 'ONLINE'
+  const isAnchor     = payment.isAnchorMonth !== false
   const dotColor     = isOnline ? '#7c3aed' : '#16a34a'
   const coveredCount = payment.paidMonths?.length ?? 1
   const isMultiMonth = coveredCount > 1
@@ -1121,22 +1144,44 @@ function PaymentCell({ payment, loading, onEdit }: { payment?: Payment; loading?
     return MONTH_LABELS[parseInt(ms, 10) - 1] ?? bm
   })
   // transactionAmount is the real total on both anchor and clone rows.
-  // payment.amount would be 0 on a clone — never use it for display.
-  const tooltipText = [
-    `Paid ${payment.date}`,
-    `₹${payment.transactionAmount.toLocaleString('en-IN')} total`,
-    payment.mode,
-    isMultiMonth ? `Covers: ${coveredLabels.join(' + ')}` : null,
-    payment.notes ? `Note: ${payment.notes}` : null,
-    'Click to view transaction',
-  ].filter(Boolean).join(' · ')
+  // Never show it on clone cells — it would be confusing to see ₹600 on an Apr
+  // cell when Jun is the actual payment date.
+  const tooltipText = isAnchor
+    ? [
+        `Paid ${payment.date}`,
+        `₹${payment.transactionAmount.toLocaleString('en-IN')}`,
+        payment.mode,
+        isMultiMonth ? `Covers: ${coveredLabels.join(' + ')}` : null,
+        payment.notes ? `Note: ${payment.notes}` : null,
+        'Click to view transaction',
+      ].filter(Boolean).join(' · ')
+    : [
+        `Covered by ₹${payment.transactionAmount.toLocaleString('en-IN')} paid on ${payment.date}`,
+        isMultiMonth ? `(covers ${coveredLabels.join(' + ')})` : null,
+        'Click to view source transaction',
+      ].filter(Boolean).join(' ')
+
+  // Anchor: truncate amount to fit — e.g. ₹1,20,000 → ₹1.2L
+  const amtDisplay = (() => {
+    const n = payment.transactionAmount
+    if (n >= 100000) return `₹${(n / 100000).toFixed(1)}L`
+    if (n >= 1000)   return `₹${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}K`
+    return `₹${n}`
+  })()
+
+  // Short date for anchor cell: "10 Jun"
+  const shortDate = (() => {
+    if (!payment.date) return ''
+    const [dd, mm] = payment.date.split('/')
+    return `${parseInt(dd, 10)} ${MONTH_LABELS[parseInt(mm, 10) - 1]}`
+  })()
 
   return (
     <td
       onClick={onEdit}
       title={tooltipText}
       style={{
-        padding: '5px 2px', textAlign: 'center',
+        padding: '4px 2px', textAlign: 'center',
         borderBottom: '1px solid #f1f5f9',
         cursor: onEdit ? 'pointer' : 'default',
         transition: 'background 0.1s ease',
@@ -1144,138 +1189,256 @@ function PaymentCell({ payment, loading, onEdit }: { payment?: Payment; loading?
       onMouseEnter={e => { if (onEdit) (e.currentTarget as HTMLElement).style.background = '#f0fdf4' }}
       onMouseLeave={e => { if (onEdit) (e.currentTarget as HTMLElement).style.background = '' }}
     >
-      <div style={{
-        margin: '0 auto', width: 42,
-        borderRadius: 6,
-        background: '#dcfce7',
-        border: `1.5px solid ${isMultiMonth ? '#86efac' : '#a7f3d0'}`,
-        display: 'flex', flexDirection: 'column', alignItems: 'center',
-        gap: 0, padding: '3px 2px', position: 'relative', overflow: 'visible',
-      }}>
-        {/* Mode dot — top right */}
-        <span style={{
-          position: 'absolute', top: 2, right: 2,
-          width: 5, height: 5, borderRadius: '50%',
-          background: dotColor,
-          flexShrink: 0,
-        }} />
-        {/* PAID label */}
-        <span style={{ fontSize: 9, fontWeight: 800, color: '#15803d', letterSpacing: '0.04em' }}>PAID</span>
-        {/* Multi-month badge */}
-        {isMultiMonth && (
+      {isAnchor ? (
+        /* ── Anchor cell: money lives here ── */
+        <div style={{
+          margin: '0 auto', width: 56,
+          borderRadius: 6,
+          background: '#dcfce7',
+          borderTop: '1.5px solid #86efac',
+          borderRight: '1.5px solid #86efac',
+          borderBottom: '1.5px solid #86efac',
+          borderLeft: '4px solid #16a34a',
+          display: 'flex', flexDirection: 'column', alignItems: 'center',
+          padding: '3px 3px 3px 1px', position: 'relative', gap: 0,
+        }}>
+          {/* Mode dot — top right */}
           <span style={{
-            fontSize: 8, fontWeight: 700, color: '#7c3aed',
-            background: '#ede9fe', borderRadius: 3,
-            padding: '0 3px', lineHeight: '12px', whiteSpace: 'nowrap',
-          }}>{coveredCount}mo</span>
-        )}
-      </div>
+            position: 'absolute', top: 2, right: 2,
+            width: 5, height: 5, borderRadius: '50%',
+            background: dotColor,
+          }} />
+          {/* Amount — the actual transaction total */}
+          <span style={{ fontSize: 9, fontWeight: 800, color: '#166534', letterSpacing: '-0.2px', lineHeight: 1.1 }}>{amtDisplay}</span>
+          {/* Date + mode on one line */}
+          <span style={{ fontSize: 7, color: '#4b7a55', lineHeight: 1.1, whiteSpace: 'nowrap' }}>
+            {shortDate} {payment.mode === 'CASH' ? '💵' : '🌐'}
+          </span>
+          {/* Multi-month badge */}
+          {isMultiMonth && (
+            <span style={{
+              fontSize: 7, fontWeight: 700, color: '#5b21b6',
+              background: '#ede9fe', borderRadius: 3,
+              padding: '0 3px', lineHeight: '11px', whiteSpace: 'nowrap',
+            }}>{coveredCount}mo</span>
+          )}
+        </div>
+      ) : (
+        /* ── Clone cell: covered by a transaction in another month ── */
+        <div style={{
+          margin: '0 auto', width: 56,
+          borderRadius: 6,
+          background: '#f0fdf4',
+          borderTop: '1.5px solid #bbf7d0',
+          borderRight: '1.5px solid #bbf7d0',
+          borderBottom: '1.5px solid #bbf7d0',
+          borderLeft: '2px solid #4ade80',
+          display: 'flex', flexDirection: 'column', alignItems: 'center',
+          justifyContent: 'center',
+          padding: '3px 2px', position: 'relative', height: 34,
+        }}>
+          {/* Mode dot */}
+          <span style={{
+            position: 'absolute', top: 2, right: 2,
+            width: 4, height: 4, borderRadius: '50%',
+            background: dotColor, opacity: 0.7,
+          }} />
+          {/* Checkmark only — no amount */}
+          <span style={{ fontSize: 12, color: '#16a34a', lineHeight: 1 }}>✓</span>
+        </div>
+      )}
     </td>
   )
 }
 
 // ─── Calendar View ────────────────────────────────────────────────────────────
-// Architecture rule: one calendar event per PaymentTransaction, placed on the
-// payment date (processedAt). Multi-month transactions show ALL covered months
-// as chips. Amount shown is the real total, never a per-month split.
+// Day-grouped pill design — scales to 300+ flats without blowing up page height.
+// Each transaction is a compact pill (20px) grouped under its payment date.
+// Color: green = CASH, blue/purple = ONLINE.
+// Click any pill → opens FlatPanel for that flat's full transaction detail.
 
 function CalendarView({ flats, loading, onFlatClick }: { flats: Flat[]; loading: boolean; onFlatClick: (f: Flat) => void }) {
-  // Collect one entry per ANCHOR transaction. Since a multi-month transaction
-  // covers e.g. Jan+Feb, we place it in the calendar month matching its
-  // billingMonth (which is the anchor/earliest covered month).
+  // expandedMonth tracks which month card is showing all days (null = none)
+  const [expandedMonth, setExpandedMonth] = useState<string | null>(null)
+
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
       {MONTHS.map((mon, mi) => {
-        const monthKey  = `2026-${String(mi + 1).padStart(2, '0')}`
-        // Only anchor rows whose billingMonth falls in this calendar slot
+        const monthKey = `2026-${String(mi + 1).padStart(2, '0')}`
         type AnchorRow = Payment & { flatRef: Flat }
+
+        // All anchor transactions for this month, placed by payment date
         const events: AnchorRow[] = loading ? [] : flats.flatMap(f =>
           f.payments
             .filter(p => p.isAnchorMonth !== false && p.billingMonth === monthKey)
             .map(p => ({ ...p, flatRef: f }))
         )
+
         const totalCollected = events.reduce((s, e) => s + e.amount, 0)
         const onlineCount    = events.filter(e => e.mode === 'ONLINE').length
         const cashCount      = events.filter(e => e.mode === 'CASH').length
+        const isExpanded     = expandedMonth === monthKey
+
+        // Group by payment date (dd/mm/yyyy → "10 Jun" label)
+        const byDay = new Map<string, AnchorRow[]>()
+        events.forEach(ev => {
+          const dayKey = ev.date || 'Unknown'
+          if (!byDay.has(dayKey)) byDay.set(dayKey, [])
+          byDay.get(dayKey)!.push(ev)
+        })
+        // Sort day groups chronologically
+        const dayGroups = Array.from(byDay.entries()).sort(([a], [b]) => {
+          const parse = (d: string) => { const [dd, mm, yyyy] = d.split('/'); return new Date(+yyyy, +mm - 1, +dd).getTime() }
+          return parse(a) - parse(b)
+        })
+
+        // How many day-groups to show before collapsing
+        const DAYS_PREVIEW = 3
+        const visibleGroups = isExpanded ? dayGroups : dayGroups.slice(0, DAYS_PREVIEW)
+        const hiddenDays    = dayGroups.length - DAYS_PREVIEW
+
+        // Format "10/06/2026" → "10 Jun"
+        const fmtDayLabel = (d: string) => {
+          if (!d || d === 'Unknown') return 'Unknown date'
+          const [dd, mm] = d.split('/')
+          return `${parseInt(dd, 10)} ${MONTH_LABELS[parseInt(mm, 10) - 1]}`
+        }
+
+        // Amount display inside pill
+        const pillAmt = (n: number) => {
+          if (n >= 100000) return `₹${(n / 100000).toFixed(1)}L`
+          if (n >= 1000)   return `₹${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}K`
+          return `₹${n}`
+        }
 
         return (
           <div key={mon} style={{ borderRadius: 14, border: '1px solid #e2e8f0', background: '#fff', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+
             {/* Month header */}
             <div style={{ padding: '10px 14px 8px', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <span style={{ fontSize: 12, fontWeight: 800, color: '#0f172a', letterSpacing: '0.04em' }}>{mon}</span>
-              {totalCollected > 0
-                ? <span style={{ fontSize: 11, fontWeight: 700, color: '#16a34a' }}>₹{(totalCollected / 1000).toFixed(1)}K</span>
-                : <span style={{ fontSize: 11, color: '#94a3b8' }}>₹0</span>
-              }
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                {totalCollected > 0 && (
+                  <span style={{ fontSize: 11, fontWeight: 700, color: '#16a34a' }}>
+                    ₹{totalCollected >= 1000 ? `${(totalCollected / 1000).toFixed(1)}K` : totalCollected}
+                  </span>
+                )}
+                {events.length > 0 && (
+                  <span style={{ fontSize: 10, color: '#94a3b8', fontWeight: 500 }}>{events.length} txns</span>
+                )}
+              </div>
             </div>
 
-            {/* Event cards — one per transaction */}
-            <div style={{ padding: '8px 8px', display: 'flex', flexDirection: 'column', gap: 5, flex: 1, minHeight: 60 }}>
+            {/* Day-grouped pill rows */}
+            <div style={{ padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minHeight: 56 }}>
               {loading
                 ? Array.from({ length: 3 }).map((_, i) => (
-                    <div key={i} style={{ height: 38, borderRadius: 7, background: '#f1f5f9', animation: 'pulse 1.5s ease-in-out infinite' }} />
+                    <div key={i} style={{ height: 20, borderRadius: 10, background: '#f1f5f9', animation: 'pulse 1.5s ease-in-out infinite' }} />
                   ))
                 : events.length === 0
                   ? <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, color: '#e2e8f0', fontSize: 11, fontWeight: 600, paddingBottom: 8 }}>No payments</div>
-                  : events.slice(0, 8).map(ev => {
-                      const isOnline = ev.mode === 'ONLINE'
-                      const borderCol = isOnline ? '#a78bfa' : '#86efac'
-                      const bgCol     = isOnline ? '#faf5ff' : '#f0fdf4'
-                      // All covered months as chips — the KEY visual: one card, multiple month chips
-                      const coveredChips = (ev.paidMonths?.length ? ev.paidMonths : [ev.billingMonth]).map(bm => {
-                        const [, ms] = bm.split('-')
-                        return MONTH_LABELS[parseInt(ms, 10) - 1] ?? bm
-                      })
-                      const isMulti = coveredChips.length > 1
+                  : visibleGroups.map(([dayKey, dayEvents]) => {
+                      // Show up to 3 pills per day, then "+N more" overflow
+                      const PILLS_PER_DAY = 3
+                      const visiblePills  = dayEvents.slice(0, PILLS_PER_DAY)
+                      const overflow      = dayEvents.length - PILLS_PER_DAY
+
                       return (
-                        <div
-                          key={ev.transactionId ?? ev.id}
-                          onClick={() => onFlatClick(ev.flatRef)}
-                          title={`${ev.flatRef.block} / ${ev.flatRef.flat} · ₹${ev.amount.toLocaleString('en-IN')} · ${ev.mode}${isMulti ? ' · Multi-month: ' + coveredChips.join('+') : ''} · Click to view`}
-                          style={{ padding: '7px 9px', borderRadius: 8, background: bgCol, border: `1.5px solid ${borderCol}`, cursor: 'pointer', transition: 'transform 0.1s ease' }}
-                          onMouseEnter={e => ((e.currentTarget as HTMLElement).style.transform = 'scale(1.02)')}
-                          onMouseLeave={e => ((e.currentTarget as HTMLElement).style.transform = 'scale(1)')}
-                        >
-                          {/* Row 1: amount + mode */}
-                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                            <span style={{ fontSize: 12, fontWeight: 800, color: '#0f172a' }}>
-                              ₹{ev.amount.toLocaleString('en-IN')}
-                            </span>
-                            <span style={{ fontSize: 9, fontWeight: 700, color: isOnline ? '#7c3aed' : '#16a34a', background: isOnline ? '#ede9fe' : '#dcfce7', borderRadius: 4, padding: '1px 5px' }}>
-                              {ev.mode}
-                            </span>
+                        <div key={dayKey}>
+                          {/* Day label */}
+                          <div style={{ fontSize: 9, fontWeight: 700, color: '#94a3b8', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 3 }}>
+                            {fmtDayLabel(dayKey)}
                           </div>
-                          {/* Row 2: month chips (THE key architecture rule — show all covered months) */}
-                          <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap', marginBottom: 3 }}>
-                            {coveredChips.map(chip => (
-                              <span key={chip} style={{ fontSize: 9, fontWeight: 700, color: '#1d4ed8', background: '#dbeafe', borderRadius: 3, padding: '1px 4px', whiteSpace: 'nowrap' }}>{chip}</span>
-                            ))}
-                          </div>
-                          {/* Row 3: flat + date */}
-                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <span style={{ fontSize: 10, color: '#64748b', fontWeight: 600 }}>{ev.flatRef.block} / {ev.flatRef.flat}</span>
-                            {ev.date && <span style={{ fontSize: 9, color: '#94a3b8' }}>{ev.date}</span>}
+                          {/* Pills row — wraps naturally */}
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3 }}>
+                            {visiblePills.map(ev => {
+                              const isOnline    = ev.mode === 'ONLINE'
+                              const pillBg      = isOnline ? '#eff6ff' : '#f0fdf4'
+                              const pillBorder  = isOnline ? '#bfdbfe' : '#bbf7d0'
+                              const dotColor    = isOnline ? '#3b82f6' : '#16a34a'
+                              const textColor   = isOnline ? '#1e40af' : '#166534'
+                              const flat        = `${ev.flatRef.block.replace('Block-', 'B')}-${ev.flatRef.flat}`
+                              const coveredChips = (ev.paidMonths?.length ? ev.paidMonths : [ev.billingMonth]).map(bm => {
+                                const [, ms] = bm.split('-')
+                                return MONTH_LABELS[parseInt(ms, 10) - 1] ?? bm
+                              })
+                              const tipText = `${ev.flatRef.block} / ${ev.flatRef.flat} · ${pillAmt(ev.amount)} · ${ev.mode}${coveredChips.length > 1 ? ' · covers ' + coveredChips.join('+') : ''} · Click to view`
+
+                              return (
+                                <div
+                                  key={ev.transactionId ?? ev.id}
+                                  onClick={() => onFlatClick(ev.flatRef)}
+                                  title={tipText}
+                                  style={{
+                                    display: 'flex', alignItems: 'center', gap: 3,
+                                    height: 20, padding: '0 6px',
+                                    borderRadius: 10,
+                                    background: pillBg,
+                                    border: `1px solid ${pillBorder}`,
+                                    cursor: 'pointer',
+                                    transition: 'opacity 0.1s',
+                                  }}
+                                  onMouseEnter={e => ((e.currentTarget as HTMLElement).style.opacity = '0.75')}
+                                  onMouseLeave={e => ((e.currentTarget as HTMLElement).style.opacity = '1')}
+                                >
+                                  {/* Mode dot */}
+                                  <span style={{ width: 5, height: 5, borderRadius: '50%', background: dotColor, flexShrink: 0 }} />
+                                  {/* Amount */}
+                                  <span style={{ fontSize: 9, fontWeight: 700, color: textColor, whiteSpace: 'nowrap' }}>
+                                    {pillAmt(ev.amount)}
+                                  </span>
+                                  {/* Flat shortcode */}
+                                  <span style={{ fontSize: 9, color: '#64748b', whiteSpace: 'nowrap' }}>{flat}</span>
+                                  {/* Multi-month indicator */}
+                                  {coveredChips.length > 1 && (
+                                    <span style={{ fontSize: 7, fontWeight: 700, color: '#7c3aed', background: '#ede9fe', borderRadius: 3, padding: '0 2px', lineHeight: '11px' }}>
+                                      {coveredChips.length}m
+                                    </span>
+                                  )}
+                                </div>
+                              )
+                            })}
+                            {overflow > 0 && (
+                              <div style={{ height: 20, padding: '0 5px', display: 'flex', alignItems: 'center', fontSize: 9, color: '#94a3b8', fontWeight: 600 }}>
+                                +{overflow}
+                              </div>
+                            )}
                           </div>
                         </div>
                       )
                     })
               }
-              {!loading && events.length > 8 && (
-                <div style={{ fontSize: 10, color: '#94a3b8', fontWeight: 600, textAlign: 'center', padding: '3px 0' }}>
-                  +{events.length - 8} more
-                </div>
+
+              {/* Show more / collapse days */}
+              {!loading && !isExpanded && hiddenDays > 0 && (
+                <button
+                  onClick={() => setExpandedMonth(monthKey)}
+                  style={{ alignSelf: 'flex-start', fontSize: 10, fontWeight: 600, color: '#3b82f6', background: 'none', border: 'none', cursor: 'pointer', padding: '2px 0' }}
+                >
+                  +{hiddenDays} more {hiddenDays === 1 ? 'day' : 'days'} →
+                </button>
+              )}
+              {!loading && isExpanded && dayGroups.length > DAYS_PREVIEW && (
+                <button
+                  onClick={() => setExpandedMonth(null)}
+                  style={{ alignSelf: 'flex-start', fontSize: 10, fontWeight: 600, color: '#94a3b8', background: 'none', border: 'none', cursor: 'pointer', padding: '2px 0' }}
+                >
+                  ↑ Collapse
+                </button>
               )}
             </div>
 
             {/* Footer counts */}
-            <div style={{ padding: '6px 12px 10px', display: 'flex', gap: 10, fontSize: 10, borderTop: events.length > 0 ? '1px solid #f1f5f9' : 'none' }}>
-              <span style={{ display: 'flex', alignItems: 'center', gap: 3, color: '#7c3aed', fontWeight: 600 }}>
-                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#a78bfa', display: 'inline-block' }} />{onlineCount} online
-              </span>
-              <span style={{ display: 'flex', alignItems: 'center', gap: 3, color: '#d97706', fontWeight: 600 }}>
-                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#fcd34d', display: 'inline-block' }} />{cashCount} cash
-              </span>
-            </div>
+            {events.length > 0 && (
+              <div style={{ padding: '5px 12px 8px', display: 'flex', gap: 10, fontSize: 10, borderTop: '1px solid #f1f5f9' }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 3, color: '#1e40af', fontWeight: 600 }}>
+                  <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#3b82f6', display: 'inline-block' }} />{onlineCount} online
+                </span>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 3, color: '#166534', fontWeight: 600 }}>
+                  <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#16a34a', display: 'inline-block' }} />{cashCount} cash
+                </span>
+              </div>
+            )}
           </div>
         )
       })}
@@ -1720,17 +1883,17 @@ export default function PaymentsPage() {
           </button>
         </div>
 
-        {/* ── Heat Map Tab (original table — preserved exactly) ── */}
+        {/* ── Heat Map Tab ── */}
         {activeTab === 'heatmap' && (
           <div style={{ width: '100%', boxSizing: 'border-box', borderRadius: 14, overflow: 'hidden', border: '1px solid #e2e8f0' }}>
-            <div style={{ width: '100%' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
+            <div style={{ width: '100%', overflowX: 'auto' }}>
+              <table style={{ width: '100%', minWidth: 900, borderCollapse: 'collapse', tableLayout: 'fixed' }}>
                 <thead>
                   <tr style={{ background: '#0f172a' }}>
                     <th style={{ padding: '10px 8px', textAlign: 'left', fontSize: 10, fontWeight: 700, color: '#fff', letterSpacing: '0.06em', textTransform: 'uppercase', width: '7%' }}>Block</th>
                     <th style={{ padding: '10px 6px', textAlign: 'left', fontSize: 10, fontWeight: 700, color: '#fff', letterSpacing: '0.06em', textTransform: 'uppercase', width: '4%' }}>Flat</th>
                     {MONTHS.map((m, i) => (
-                      <th key={m} style={{ padding: '6px 2px', textAlign: 'center', background: '#0f172a', width: '6.5%' }}>
+                      <th key={m} style={{ padding: '6px 2px', textAlign: 'center', background: '#0f172a', width: '5.5%' }}>
                         <div style={{ fontSize: 10, fontWeight: 700, color: '#fff', letterSpacing: '0.04em' }}>{m}</div>
                         <div style={{ fontSize: 9, fontWeight: 700, color: monthStats[i].total > 0 ? '#34d399' : '#475569' }}>
                           {monthStats[i].total > 0 ? `₹${(monthStats[i].total / 1000).toFixed(1)}K` : '₹0'}
