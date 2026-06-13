@@ -125,7 +125,7 @@ function ModalShell({ title, maxWidth=480, onClose, children }: { title:string; 
 }
 
 // ─── Full-page Detail Panel (replaces the side drawer) ────────────────────────
-function DetailPanel({ entry, onClose, onPaymentRecorded }: { entry:any; onClose:()=>void; onPaymentRecorded:()=>void }) {
+function DetailPanel({ entry, enriching=false, onClose, onPaymentRecorded }: { entry:any; enriching?:boolean; onClose:()=>void; onPaymentRecorded:()=>void }) {
   const [payments,setPayments]           = useState<Payment[]>([])
   const [payLoading,setPayLoading]       = useState(true)
   const [recording,setRecording]         = useState<Payment|null>(null)
@@ -241,9 +241,17 @@ function DetailPanel({ entry, onClose, onPaymentRecorded }: { entry:any; onClose
 
         {/* Top bar */}
         <div style={{ background:'white', borderBottom:`1px solid var(--border)`, padding:'14px 24px', display:'flex', alignItems:'center', justifyContent:'space-between', flexShrink:0, position:'sticky', top:0, zIndex:10 }}>
-          <div>
-            <div style={{ fontSize:16, fontWeight:700, color:T.text }}>Flat Search</div>
-            <div style={{ fontSize:12, color:T.muted, marginTop:1 }}>MIG Society, Sector-29 · Resident profile &amp; payment history</div>
+          <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+            <div>
+              <div style={{ fontSize:16, fontWeight:700, color:T.text }}>Flat Search</div>
+              <div style={{ fontSize:12, color:T.muted, marginTop:1 }}>MIG Society, Sector-29 · Resident profile &amp; payment history</div>
+            </div>
+            {enriching && (
+              <div style={{ display:'inline-flex', alignItems:'center', gap:5, padding:'3px 10px', borderRadius:20, fontSize:11, fontWeight:600, background:T.brandLight, color:T.brand, border:`1px solid ${T.brandMid}` }}>
+                <i className="ti ti-loader-2" aria-hidden style={{ fontSize:12, animation:'spin 1s linear infinite' }} />
+                Loading details…
+              </div>
+            )}
           </div>
           <button onClick={onClose} style={{ display:'inline-flex', alignItems:'center', gap:6, padding:'7px 14px', borderRadius:9, fontSize:13, fontWeight:600, background:'var(--gray-100)', border:`1px solid var(--border)`, color:T.text, cursor:'pointer' }}>
             <i className="ti ti-x" aria-hidden style={{ fontSize:14 }} />Close
@@ -528,7 +536,8 @@ export default function SearchPage() {
   const [loading,  setLoading]  = useState(false)
   const [searched, setSearched] = useState(false)
   const [error,    setError]    = useState('')
-  const [selected, setSelected] = useState<any|null>(null)
+  const [selected,  setSelected]  = useState<any|null>(null)
+  const [enriching, setEnriching] = useState(false)
   const [offset,   setOffset]   = useState(0)
   const [hasMore,  setHasMore]  = useState(false)
   const [stats,    setStats]    = useState<{totalFlats:number;occupied:number;paymentRecords:number}|null>(null)
@@ -565,28 +574,38 @@ export default function SearchPage() {
     } catch { /* ignore */ }
   },[])
 
+  // Use a ref for offset so doSearch closure never goes stale
+  const offsetRef = useRef(0)
+
+  // Simple in-memory cache: key → {resident, flat} to avoid re-fetching on re-click
+  const residentCache = useRef<Map<string,any>>(new Map())
+  const flatCache     = useRef<Map<string,any>>(new Map())
+
   const doSearch = useCallback(async (q:string, append=false)=>{
-    if (!q||q.length<2) { setResults([]); setSearched(false); setHasMore(false); setOffset(0); return }
+    if (!q||q.length<2) { setResults([]); setSearched(false); setHasMore(false); offsetRef.current=0; setOffset(0); return }
     controllerRef.current?.abort()
     const ctl = new AbortController()
     controllerRef.current = ctl
     if (!append) { setLoading(true); setError('') }
     try {
-      const res = await searchAll(q,{ limit:LIMIT, offset:append?offset:0 },{ signal:ctl.signal })
+      const currentOffset = append ? offsetRef.current : 0
+      const res = await searchAll(q,{ limit:LIMIT, offset:currentOffset },{ signal:ctl.signal })
       if (append) setResults(prev=>[...prev,...res]); else setResults(res)
       setSearched(true); setHasMore(res.length===LIMIT)
-      setOffset(prev=>append?prev+res.length:res.length)
+      offsetRef.current = currentOffset + res.length
+      setOffset(offsetRef.current)
     } catch(e:any) {
       if (e.name==='AbortError') return
       setError(e.message??'Search failed')
     } finally { setLoading(false) }
-  },[offset])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[])  // stable — uses offsetRef, not offset state
 
   useEffect(()=>{
-    if (!query||query.length<2) { setResults([]); setSearched(false); setHasMore(false); setOffset(0); return }
-    const t = window.setTimeout(()=>{ setOffset(0); doSearch(query,false) },250)
+    if (!query||query.length<2) { setResults([]); setSearched(false); setHasMore(false); offsetRef.current=0; setOffset(0); return }
+    const t = window.setTimeout(()=>{ offsetRef.current=0; doSearch(query,false) },200)
     return ()=>window.clearTimeout(t)
-  },[query])
+  },[query,doSearch])
 
   const clearSearch = ()=>{ setQuery(''); setResults([]); setSearched(false); setSelected(null); inputRef.current?.focus() }
   const loadMore    = ()=>{ if (!hasMore||loading) return; doSearch(query,true) }
@@ -601,26 +620,73 @@ export default function SearchPage() {
   )
 
   const handleResultClick = async (entry:any)=>{
+    // ── Step 1: open modal IMMEDIATELY with what we already have ─────────────
+    // The search result already contains person, flat, vehicles from the index.
+    // Show them right away so the user sees something in <1 frame.
+    const instant = normalise(entry)
+    setSelected(instant)
+
+    // ── Step 2: enrich in the background (non-blocking) ──────────────────────
     const personId = entry?.person?.id ?? entry?.ownerships?.[0]?.person?.id ?? entry?.tenancies?.[0]?.person?.id
-    if (!personId) { setSelected(normalise(entry)); return }
+    if (!personId) return  // nothing more to fetch
+    setEnriching(true)
+
     try {
-      const resident = await api.getResident(personId)
-      const flatId   = entry.flat?.id ?? (resident.ownerships?.[0] as any)?.flatId ?? (resident.tenancies?.[0] as any)?.flatId ?? (resident.ownerships?.[0] as any)?.flat?.id ?? (resident.tenancies?.[0] as any)?.flat?.id
-      let flatFull   = entry.flat
-      if (flatId) { try { flatFull=await api.getFlat(flatId) } catch{ /* use entry.flat */ } }
-      let roleForFlat = entry.role
-      if (resident.ownerships?.some((o:any)=>o.flatId===flatId))      roleForFlat='Owner'
-      else if (resident.tenancies?.some((t:any)=>t.flatId===flatId))  roleForFlat='Tenant'
-      let ownershipsSource = flatFull?.ownerships??resident.ownerships??[]
-      let ownerResident:any=null
-      const primaryOwner = ownershipsSource.find((o:any)=>o.isPrimary)??ownershipsSource[0]
-      const ownerPid     = primaryOwner?.person?.id??primaryOwner?.personId
-      if (ownerPid&&ownerPid!==personId) {
-        try { ownerResident=await api.getResident(ownerPid); ownershipsSource=[{...primaryOwner,person:ownerResident},...ownershipsSource.filter((o:any)=>o!==primaryOwner)] }
-        catch{ /* best-effort */ }
+      // Use cache to avoid redundant network calls on re-click
+      const getCachedResident = async (id:string) => {
+        if (residentCache.current.has(id)) return residentCache.current.get(id)
+        const r = await api.getResident(id)
+        residentCache.current.set(id, r)
+        return r
       }
-      setSelected(normalise({ person:resident, flat:flatFull, role:roleForFlat, ownerships:ownershipsSource, tenancies:flatFull?.tenancies??resident.tenancies, vehicles:[...(ownerResident?.vehicles??[]),...(resident.vehicles??[]),...(entry.vehicles??[])] }))
-    } catch { setSelected(normalise(entry)) }
+      const getCachedFlat = async (id:string) => {
+        if (flatCache.current.has(id)) return flatCache.current.get(id)
+        const f = await api.getFlat(id)
+        flatCache.current.set(id, f)
+        return f
+      }
+
+      // Fire resident + flat fetches in PARALLEL (not sequential)
+      const flatId = entry.flat?.id
+      const [resident, flatFull] = await Promise.all([
+        getCachedResident(personId),
+        flatId ? getCachedFlat(flatId).catch(()=>entry.flat) : Promise.resolve(entry.flat),
+      ])
+
+      let roleForFlat = entry.role
+      if (resident.ownerships?.some((o:any)=>o.flatId===flatId))     roleForFlat='Owner'
+      else if (resident.tenancies?.some((t:any)=>t.flatId===flatId)) roleForFlat='Tenant'
+
+      let ownershipsSource = flatFull?.ownerships ?? resident.ownerships ?? []
+      const primaryOwner   = ownershipsSource.find((o:any)=>o.isPrimary) ?? ownershipsSource[0]
+      const ownerPid       = primaryOwner?.person?.id ?? primaryOwner?.personId
+
+      // Fetch owner separately only if different from the clicked person
+      const ownerResident = (ownerPid && ownerPid !== personId)
+        ? await getCachedResident(ownerPid).catch(()=>null)
+        : null
+
+      if (ownerResident) {
+        ownershipsSource = [
+          { ...primaryOwner, person: ownerResident },
+          ...ownershipsSource.filter((o:any)=>o !== primaryOwner),
+        ]
+      }
+
+      // Update the already-open modal with the enriched data
+      setSelected(normalise({
+        person:     resident,
+        flat:       flatFull,
+        role:       roleForFlat,
+        ownerships: ownershipsSource,
+        tenancies:  flatFull?.tenancies ?? resident.tenancies,
+        vehicles:   [...(ownerResident?.vehicles??[]),...(resident.vehicles??[]),...(entry.vehicles??[])],
+      }))
+    } catch {
+      // Modal is already open with instant data — just leave it
+    } finally {
+      setEnriching(false)
+    }
   }
 
   const AVATAR_PALETTE = [
@@ -713,8 +779,51 @@ export default function SearchPage() {
         </div>
       )}
 
-      {/* Dropdown-style results panel */}
-      {searched && grouped.length > 0 && (
+      {/* ── Loading skeleton — shown while fetching, in place of results ─────── */}
+      {loading && (
+        <div className="card fade-up" style={{ overflow:'hidden', padding:0, marginTop:0 }}>
+          {/* Header row matching the results panel */}
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'10px 16px', background:'var(--gray-50)', borderBottom:`1px solid var(--border)` }}>
+            <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+              {/* Shimmer pill for "MATCHING FLATS" label */}
+              <div style={{ width:110, height:14, borderRadius:20, background:'var(--gray-200)', animation:'shimmer 1.4s ease infinite' }} />
+              {/* Shimmer count badge */}
+              <div style={{ width:22, height:14, borderRadius:20, background:'var(--gray-200)', animation:'shimmer 1.4s ease infinite' }} />
+            </div>
+            <div style={{ display:'flex', alignItems:'center', gap:6, color:T.brand, fontSize:12, fontWeight:600 }}>
+              <i className="ti ti-loader-2" aria-hidden style={{ fontSize:14, animation:'spin 1s linear infinite' }} />
+              Searching…
+            </div>
+          </div>
+
+          {/* 5 skeleton rows that look exactly like real result rows */}
+          {[1,2,3,4,5].map((n,i)=>(
+            <div key={n} style={{
+              display:'flex', alignItems:'center', gap:14, padding:'13px 16px',
+              borderBottom: i < 4 ? `1px solid var(--border)` : 'none',
+              animation:`shimmer 1.4s ease ${i*0.08}s infinite`
+            }}>
+              {/* Flat badge placeholder */}
+              <div style={{ width:40, height:40, borderRadius:12, background:'var(--gray-100)', flexShrink:0 }} />
+
+              <div style={{ flex:1, display:'flex', flexDirection:'column' as const, gap:7 }}>
+                {/* Flat label line — varies width for realism */}
+                <div style={{ height:13, borderRadius:20, background:'var(--gray-100)', width:`${[52,44,60,38,48][i]}%` }} />
+                {/* Sub-info line */}
+                <div style={{ height:10, borderRadius:20, background:'var(--gray-100)', width:`${[34,28,40,24,32][i]}%` }} />
+              </div>
+
+              {/* Status badge placeholder */}
+              <div style={{ width:88, height:22, borderRadius:20, background:'var(--gray-100)', flexShrink:0 }} />
+              {/* Chevron placeholder */}
+              <div style={{ width:14, height:14, borderRadius:4, background:'var(--gray-100)', flexShrink:0 }} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ── Matching results ──────────────────────────────────────────────────── */}
+      {!loading && searched && grouped.length > 0 && (
         <div className="card fade-up" style={{ overflow:'hidden', padding:0, marginTop:0 }}>
           <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'10px 16px', background:'var(--gray-50)', borderBottom:`1px solid var(--border)` }}>
             <div style={{ fontSize:11, fontWeight:700, letterSpacing:'.07em', textTransform:'uppercase' as const, color:T.muted, display:'flex', alignItems:'center', gap:6 }}>
@@ -803,27 +912,12 @@ export default function SearchPage() {
         </div>
       )}
 
-      {/* Loading skeleton */}
-      {loading && (
-        <div className="card" style={{ overflow:'hidden', marginTop:0 }}>
-          {[1,2,3].map(n=>(
-            <div key={n} style={{ display:'flex', alignItems:'center', gap:12, padding:'12px 16px', borderBottom:n<3?`1px solid var(--border)`:'none', animation:'pulse 1.4s ease infinite' }}>
-              <div style={{ width:40, height:40, borderRadius:12, background:'var(--gray-100)', flexShrink:0 }} />
-              <div style={{ flex:1 }}>
-                <div style={{ height:12, borderRadius:20, background:'var(--gray-100)', width:'45%', marginBottom:8 }} />
-                <div style={{ height:10, borderRadius:20, background:'var(--gray-100)', width:'30%' }} />
-              </div>
-              <div style={{ width:52, height:20, borderRadius:20, background:'var(--gray-100)' }} />
-            </div>
-          ))}
-        </div>
-      )}
-
-      {selected && <DetailPanel entry={selected} onClose={()=>setSelected(null)} onPaymentRecorded={()=>{}} />}
+      {selected && <DetailPanel entry={selected} enriching={enriching} onClose={()=>{ setSelected(null); setEnriching(false) }} onPaymentRecorded={()=>{}} />}
 
       <style>{`
         @keyframes spin    { from{transform:rotate(0)} to{transform:rotate(360deg)} }
         @keyframes pulse   { 0%,100%{opacity:1} 50%{opacity:.5} }
+        @keyframes shimmer { 0%,100%{opacity:1} 50%{opacity:.45} }
         @keyframes fade-in { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
         .fade-up { animation: fade-in .22s ease both }
         .fade-up-1 { animation-delay:.06s }
