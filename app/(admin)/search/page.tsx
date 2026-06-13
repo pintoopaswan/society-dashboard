@@ -541,9 +541,34 @@ export default function SearchPage() {
   const [offset,   setOffset]   = useState(0)
   const [hasMore,  setHasMore]  = useState(false)
   const [stats,    setStats]    = useState<{totalFlats:number;occupied:number;paymentRecords:number}|null>(null)
+  const [dropdownOpen, setDropdownOpen] = useState(false)
 
   const inputRef      = useRef<HTMLInputElement>(null)
   const controllerRef = useRef<AbortController|null>(null)
+  const searchBoxRef  = useRef<HTMLDivElement>(null)
+
+  // ── Inject Tabler Icons webfont (pinned version, idempotent) ─────────────────
+  useEffect(() => {
+    const TABLER_CDN = 'https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.30.0/dist/tabler-icons.min.css'
+    if (!document.querySelector('link[data-tabler-icons]')) {
+      const link = document.createElement('link')
+      link.rel  = 'stylesheet'
+      link.href = TABLER_CDN
+      link.setAttribute('data-tabler-icons', 'true')
+      document.head.appendChild(link)
+    }
+  }, [])
+
+  // ── Close dropdown on outside click ──────────────────────────────────────────
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (searchBoxRef.current && !searchBoxRef.current.contains(e.target as Node)) {
+        setDropdownOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
 
   // Normalise any raw search result so DetailPanel never gets undefined fields
   const normalise = (e: any) => ({
@@ -582,16 +607,16 @@ export default function SearchPage() {
   const flatCache     = useRef<Map<string,any>>(new Map())
 
   const doSearch = useCallback(async (q:string, append=false)=>{
-    if (!q||q.length<2) { setResults([]); setSearched(false); setHasMore(false); offsetRef.current=0; setOffset(0); return }
+    if (!q||q.length<2) { setResults([]); setSearched(false); setHasMore(false); offsetRef.current=0; setOffset(0); setDropdownOpen(false); return }
     controllerRef.current?.abort()
     const ctl = new AbortController()
     controllerRef.current = ctl
-    if (!append) { setLoading(true); setError('') }
+    if (!append) { setLoading(true); setError(''); setDropdownOpen(true) }
     try {
       const currentOffset = append ? offsetRef.current : 0
       const res = await searchAll(q,{ limit:LIMIT, offset:currentOffset },{ signal:ctl.signal })
       if (append) setResults(prev=>[...prev,...res]); else setResults(res)
-      setSearched(true); setHasMore(res.length===LIMIT)
+      setSearched(true); setHasMore(res.length===LIMIT); setDropdownOpen(true)
       offsetRef.current = currentOffset + res.length
       setOffset(offsetRef.current)
     } catch(e:any) {
@@ -915,6 +940,7 @@ export default function SearchPage() {
       {selected && <DetailPanel entry={selected} enriching={enriching} onClose={()=>{ setSelected(null); setEnriching(false) }} onPaymentRecorded={()=>{}} />}
 
       <style>{`
+        @import url('https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.30.0/dist/tabler-icons.min.css');
         @keyframes spin    { from{transform:rotate(0)} to{transform:rotate(360deg)} }
         @keyframes pulse   { 0%,100%{opacity:1} 50%{opacity:.5} }
         @keyframes shimmer { 0%,100%{opacity:1} 50%{opacity:.45} }
