@@ -626,7 +626,7 @@ function AddPaymentModal({
 
               {/* Billing Months (create mode only) */}
               {!editMode && (
-                <ModalField label={`Billing Months${selectedMonths.length > 0 ? ` \u00b7 ${selectedMonths.length} selected` : ''}`} error={errors.months}>
+                <ModalField label={`Billing Months${selectedMonths.length > 0 ? ` . ${selectedMonths.length} selected` : ''}`} error={errors.months}>
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6, padding: '12px', borderRadius: 10, border: `1.5px solid ${errors.months ? '#fca5a5' : '#e2e8f0'}`, background: '#fafbfc' }}>
                     {monthOptions.map(({ key, label, paid }) => {
                       const selected = selectedMonths.includes(key)
@@ -876,7 +876,7 @@ function FlatPanel({ open, flat, onClose, onAddPayment, onEditPayment, onDeleteP
                 <Home size={16} color="#16a34a" />
               </div>
               <div>
-                <p style={{ margin: 0, fontSize: 16, fontWeight: 800, color: '#0f172a' }}>{flat.block} \u00b7 Flat {flat.flat}</p>
+                <p style={{ margin: 0, fontSize: 16, fontWeight: 800, color: '#0f172a' }}>{flat.block} . Flat {flat.flat}</p>
                 <p style={{ margin: 0, fontSize: 11, color: '#94a3b8', fontWeight: 500 }}>{anchorPmts.length} transaction{anchorPmts.length !== 1 ? 's' : ''} · {paidMonthNums.size} month{paidMonthNums.size !== 1 ? 's' : ''} covered</p>
               </div>
             </div>
@@ -1821,7 +1821,7 @@ export default function PaymentsPage() {
         prefillBlock={editPrefillBlock} prefillFlat={editPrefillFlat} existingPayments={[]}
         editMode={true} editPaymentId={editPaymentId} editPrefill={editPrefill} />
 
-      <DeleteModal open={deleteOpen} payment={deletePayment} flatLabel={deleteFlatRef ? `${deleteFlatRef.block} \u00b7 Flat ${deleteFlatRef.flat}` : ''} onClose={() => setDeleteOpen(false)} onConfirm={handleDeleteConfirm} />
+      <DeleteModal open={deleteOpen} payment={deletePayment} flatLabel={deleteFlatRef ? `${deleteFlatRef.block} . Flat ${deleteFlatRef.flat}` : ''} onClose={() => setDeleteOpen(false)} onConfirm={handleDeleteConfirm} />
 
       <FlatPanel open={panelOpen} flat={panelFlat} onClose={() => setPanelOpen(false)}
         onAddPayment={(block, flat, pmts) => { setPanelOpen(false); openFlatModal(block, flat, pmts) }}
@@ -1842,7 +1842,7 @@ export default function PaymentsPage() {
 
         {/* KPI Cards */}
         <div style={{ display: 'flex', gap: 16, width: '100%' }}>
-          <KpiCard icon={<CreditCard size={18} color="#3b82f6" />} color="#3b82f6" label="Total Collection" value={fmt(totalCollection)} sub={`${collectedPct}% collected \u00b7 year 2026`} pct={collectedPct} barColor="#3b82f6" loading={allLoading} />
+          <KpiCard icon={<CreditCard size={18} color="#3b82f6" />} color="#3b82f6" label="Total Collection" value={fmt(totalCollection)} sub={`${collectedPct}% collected . year 2026`} pct={collectedPct} barColor="#3b82f6" loading={allLoading} />
           <KpiCard icon={<Home size={18} color="#10b981" />} color="#10b981" label="Paid Flats" value={`${paidFlats} / ${totalFlats}`} sub={`${paidPct}% of flats paid`} pct={paidPct} barColor="#10b981" loading={allLoading} />
           <KpiCard icon={<Globe size={18} color="#8b5cf6" />} color="#8b5cf6" label="Online Collection" value={fmt(onlineCollection)} sub="of total collected" pct={onlinePct} barColor="#8b5cf6" loading={allLoading} />
           <KpiCard icon={<Wallet size={18} color="#f59e0b" />} color="#f59e0b" label="Cash Collection" value={fmt(cashCollection)} sub="of total collected" pct={cashPct} barColor="#f59e0b" loading={allLoading} />
